@@ -1,0 +1,1220 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/**/**, package.json
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  Data/
+    ChatRepository.ts
+    Db.ts
+    relations.ts
+    schema.ts
+  Http/
+    mocks/
+      financeAgentMocks.ts
+    ChatHttpHandler.ts
+    FinanceHttpHandler.ts
+  mastra/
+    finance/
+      FinanceAgent.ts
+      FinanceAgentInstructions.ts
+    runtime/
+      AgentMemory.ts
+      Env.ts
+      FinanceMastraStorage.ts
+    tools/
+      PostgresQueryTool.ts
+    Hono.ts
+    index.ts
+  Utility/
+    Result.ts
+  SumerLabsFinanceBackendServer.ts
+package.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/Data/ChatRepository.ts">
+import type { UIMessage } from "ai";
+import { and, desc, eq, inArray } from "drizzle-orm";
+import { db } from "./Db";
+import { chats, chatModelStates, chatTurns, chatTurnModels } from "./schema";
+
+function stripFilePartsFromMessage(message: UIMessage): UIMessage {
+    return {
+        ...message,
+        parts: message.parts.filter((p) => p.type !== "file"),
+    };
+}
+
+function stripFilePartsFromMessages(messages: UIMessage[]): UIMessage[] {
+    return messages.map(stripFilePartsFromMessage);
+}
+
+export async function upsertChat(chatId: string) {
+    await db
+        .insert(chats)
+        .values({ id: chatId })
+        .onConflictDoUpdate({
+            target: chats.id,
+            set: { updatedAt: new Date() },
+        });
+}
+
+export async function upsertChatModelState(params: {
+    chatId: string;
+    modelId: string;
+    messages: UIMessage[];
+}) {
+    const { chatId, modelId } = params;
+    const cleaned = stripFilePartsFromMessages(params.messages);
+
+    await db
+        .insert(chatModelStates)
+        .values({
+            chatId,
+            modelId,
+            messages: cleaned,
+        })
+        .onConflictDoUpdate({
+            target: [chatModelStates.chatId, chatModelStates.modelId],
+            set: {
+                messages: cleaned,
+                updatedAt: new Date(),
+            },
+        });
+}
+
+export async function recordTurnIfNeeded(params: {
+    chatId: string;
+    userMessage: UIMessage | undefined;
+    modelId: string;
+}) {
+    const { chatId, userMessage, modelId } = params;
+    if (!userMessage) return;
+
+    const cleanedUser = stripFilePartsFromMessage(userMessage);
+
+    await db
+        .insert(chatTurns)
+        .values({
+            chatId,
+            userMessageId: cleanedUser.id,
+            userMessage: cleanedUser,
+        })
+        .onConflictDoNothing();
+
+    await db
+        .insert(chatTurnModels)
+        .values({
+            chatId,
+            userMessageId: cleanedUser.id,
+            modelId,
+        })
+        .onConflictDoNothing();
+}
+
+export async function getChatById(chatId: string) {
+    const chatRow = await db.query.chats.findFirst({
+        where: eq(chats.id, chatId),
+    });
+
+    if (!chatRow) {
+        return null;
+    }
+
+    const turnsRows = await db
+        .select({
+            userMessageId: chatTurns.userMessageId,
+            user: chatTurns.userMessage,
+            createdAt: chatTurns.createdAt,
+        })
+        .from(chatTurns)
+        .where(eq(chatTurns.chatId, chatId))
+        .orderBy(chatTurns.createdAt);
+
+    const userMessageIds = turnsRows.map((t) => t.userMessageId);
+
+    const modelsRows =
+        userMessageIds.length === 0
+            ? []
+            : await db
+                .select({
+                    userMessageId: chatTurnModels.userMessageId,
+                    modelId: chatTurnModels.modelId,
+                })
+                .from(chatTurnModels)
+                .where(
+                    and(
+                        eq(chatTurnModels.chatId, chatId),
+                        inArray(chatTurnModels.userMessageId, userMessageIds)
+                    )
+                );
+
+    const modelsByUserMessageId = new Map<string, string[]>();
+    for (const row of modelsRows) {
+        const arr = modelsByUserMessageId.get(row.userMessageId) ?? [];
+        arr.push(row.modelId);
+        modelsByUserMessageId.set(row.userMessageId, arr);
+    }
+
+    const turns = turnsRows.map((t) => ({
+        user: t.user,
+        models: modelsByUserMessageId.get(t.userMessageId) ?? [],
+    }));
+
+    // Load model message histories
+    const modelStates = await db
+        .select({
+            modelId: chatModelStates.modelId,
+            messages: chatModelStates.messages,
+            updatedAt: chatModelStates.updatedAt,
+        })
+        .from(chatModelStates)
+        .where(eq(chatModelStates.chatId, chatId))
+        .orderBy(desc(chatModelStates.updatedAt));
+
+    const modelMessages: Record<string, UIMessage[]> = {};
+    for (const ms of modelStates) {
+        modelMessages[ms.modelId] = ms.messages as UIMessage[];
+    }
+
+    return {
+        chatId,
+        turns,
+        modelMessages,
+    };
+}
+</file>
+
+<file path="src/Data/Db.ts">
+import { drizzle } from 'drizzle-orm/node-postgres';
+import * as schema from "./schema";
+
+export const db = drizzle(process.env.APP_CONNECTION_STRING!, { schema });
+</file>
+
+<file path="src/Data/relations.ts">
+import { relations } from "drizzle-orm/relations";
+import { chats, chatTurns, chatTurnModels, chatModelStates } from "./schema";
+
+export const chatTurnsRelations = relations(chatTurns, ({one}) => ({
+	chat: one(chats, {
+		fields: [chatTurns.chatId],
+		references: [chats.id]
+	}),
+}));
+
+export const chatsRelations = relations(chats, ({many}) => ({
+	chatTurns: many(chatTurns),
+	chatTurnModels: many(chatTurnModels),
+	chatModelStates: many(chatModelStates),
+}));
+
+export const chatTurnModelsRelations = relations(chatTurnModels, ({one}) => ({
+	chat: one(chats, {
+		fields: [chatTurnModels.chatId],
+		references: [chats.id]
+	}),
+}));
+
+export const chatModelStatesRelations = relations(chatModelStates, ({one}) => ({
+	chat: one(chats, {
+		fields: [chatModelStates.chatId],
+		references: [chats.id]
+	}),
+}));
+</file>
+
+<file path="src/Data/schema.ts">
+import { pgTable, text, timestamp, index, foreignKey, primaryKey, jsonb } from "drizzle-orm/pg-core"
+import { sql } from "drizzle-orm"
+import {UIMessage} from "ai";
+
+
+
+export const chats = pgTable("chats", {
+	id: text().primaryKey().notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const chatTurns = pgTable("chat_turns", {
+	chatId: text("chat_id").notNull(),
+	userMessageId: text("user_message_id").notNull(),
+	userMessage: jsonb("user_message").$type<UIMessage>().notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+	index("chat_turns_chat_created_at_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops"), table.createdAt.asc().nullsLast().op("text_ops")),
+	foreignKey({
+			columns: [table.chatId],
+			foreignColumns: [chats.id],
+			name: "chat_turns_chat_id_fkey"
+		}).onDelete("cascade"),
+	primaryKey({ columns: [table.userMessageId, table.chatId], name: "chat_turns_pkey"}),
+]);
+
+export const chatTurnModels = pgTable("chat_turn_models", {
+	chatId: text("chat_id").notNull(),
+	userMessageId: text("user_message_id").notNull(),
+	modelId: text("model_id").notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+	index("chat_turn_models_chat_turn_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops"), table.userMessageId.asc().nullsLast().op("text_ops")),
+	foreignKey({
+			columns: [table.chatId],
+			foreignColumns: [chats.id],
+			name: "chat_turn_models_chat_id_fkey"
+		}).onDelete("cascade"),
+	primaryKey({ columns: [table.userMessageId, table.modelId, table.chatId], name: "chat_turn_models_pkey"}),
+]);
+
+export const chatModelStates = pgTable("chat_model_states", {
+	chatId: text("chat_id").notNull(),
+	modelId: text("model_id").notNull(),
+	messages: jsonb().notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+	index("chat_model_states_chat_id_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops")),
+	foreignKey({
+			columns: [table.chatId],
+			foreignColumns: [chats.id],
+			name: "chat_model_states_chat_id_fkey"
+		}).onDelete("cascade"),
+	primaryKey({ columns: [table.modelId, table.chatId], name: "chat_model_states_pkey"}),
+]);
+</file>
+
+<file path="src/Http/mocks/financeAgentMocks.ts">
+import type { UIMessage } from "ai";
+
+/**
+ * Mock requests for StreamFinanceAgentAiSdk endpoint
+ */
+
+// Simple single user message
+export const mockSimpleUserMessage: { messages: UIMessage[] } = {
+    messages: [
+        {
+            id: "msg-001",
+            role: "user",
+            content: "What is my current account balance?",
+            parts: [{ type: "text", text: "What is my current account balance?" }],
+        },
+    ],
+};
+
+// Multi-turn conversation mock
+export const mockMultiTurnConversation: { messages: UIMessage[] } = {
+    messages: [
+        {
+            id: "msg-001",
+            role: "user",
+            content: "Show me my recent transactions",
+            parts: [{ type: "text", text: "Show me my recent transactions" }],
+        },
+        {
+            id: "msg-002",
+            role: "assistant",
+            content: "Here are your recent transactions:\n1. $50.00 - Amazon\n2. $120.00 - Electric Bill\n3. $35.50 - Gas Station",
+            parts: [{ type: "text", text: "Here are your recent transactions:\n1. $50.00 - Amazon\n2. $120.00 - Electric Bill\n3. $35.50 - Gas Station" }],
+        },
+        {
+            id: "msg-003",
+            role: "user",
+            content: "What was my total spending this month?",
+            parts: [{ type: "text", text: "What was my total spending this month?" }],
+        },
+    ],
+};
+
+// Investment query mock
+export const mockInvestmentQuery: { messages: UIMessage[] } = {
+    messages: [
+        {
+            id: "msg-001",
+            role: "user",
+            content: "What stocks should I consider for my retirement portfolio?",
+            parts: [{ type: "text", text: "What stocks should I consider for my retirement portfolio?" }],
+        },
+    ],
+};
+
+// Budget analysis mock
+export const mockBudgetAnalysis: { messages: UIMessage[] } = {
+    messages: [
+        {
+            id: "msg-001",
+            role: "user",
+            content: "Analyze my spending patterns and suggest a budget",
+            parts: [{ type: "text", text: "Analyze my spending patterns and suggest a budget" }],
+        },
+    ],
+};
+
+// Empty message (edge case)
+export const mockEmptyMessages: { messages: UIMessage[] } = {
+    messages: [],
+};
+
+// Long conversation history mock
+export const mockLongConversation: { messages: UIMessage[] } = {
+    messages: [
+        {
+            id: "msg-001",
+            role: "user",
+            content: "I need help with financial planning",
+            parts: [{ type: "text", text: "I need help with financial planning" }],
+        },
+        {
+            id: "msg-002",
+            role: "assistant",
+            content: "I'd be happy to help with your financial planning. What specific areas would you like to focus on?",
+            parts: [{ type: "text", text: "I'd be happy to help with your financial planning. What specific areas would you like to focus on?" }],
+        },
+        {
+            id: "msg-003",
+            role: "user",
+            content: "I want to save for a house down payment",
+            parts: [{ type: "text", text: "I want to save for a house down payment" }],
+        },
+        {
+            id: "msg-004",
+            role: "assistant",
+            content: "Great goal! How much are you looking to save, and what's your target timeline?",
+            parts: [{ type: "text", text: "Great goal! How much are you looking to save, and what's your target timeline?" }],
+        },
+        {
+            id: "msg-005",
+            role: "user",
+            content: "I need $50,000 in the next 2 years",
+            parts: [{ type: "text", text: "I need $50,000 in the next 2 years" }],
+        },
+    ],
+};
+</file>
+
+<file path="src/Http/ChatHttpHandler.ts">
+import type { Context } from "hono";
+import { generateId } from "ai";
+import { getChatById, upsertChat } from "../Data/ChatRepository";
+
+// POST /backend-api/chats  -> { chatId }
+export const CreateChat = async (c: Context) => {
+    const chatId = generateId();
+    await upsertChat(chatId);
+    return c.json({ chatId }, 201);
+};
+
+// GET /backend-api/chats/:chatId -> { chatId, turns, modelMessages }
+export const GetChat = async (c: Context) => {
+    const chatId = c.req.param("chatId");
+
+    const chat = await getChatById(chatId);
+    if (!chat) {
+        return c.json({ error: "chat_not_found" }, 404);
+    }
+
+    return c.json(chat);
+};
+</file>
+
+<file path="src/Http/FinanceHttpHandler.ts">
+import { mastra } from "../mastra";
+import {
+    createUIMessageStream,
+    createUIMessageStreamResponse,
+    UIMessage,
+    UIMessageStreamOnFinishCallback,
+} from "ai";
+import { toAISdkStream } from "@mastra/ai-sdk";
+import type { Context } from "hono";
+import { FINANCE_AGENT_ID } from "../mastra/finance/FinanceAgent";
+import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+
+type StreamFinanceAgentAiSdkRequest = {
+    messages: UIMessage[];
+
+    // Sent from the frontend sendMessage(..., { body: { baseChatId, modelId, ... }})
+    baseChatId: string;
+    modelId: string;
+
+    // other fields you already send; optional
+    useWebSearch?: boolean;
+    selectedFileId?: string | null;
+};
+
+export const StreamFinanceAgentAiSdk = async (c: Context) => {
+    const body = (await c.req.json()) as StreamFinanceAgentAiSdkRequest;
+
+    const { messages, baseChatId, modelId } = body;
+
+    const myAgent = mastra.getAgentById(FINANCE_AGENT_ID);
+    const stream = await myAgent.stream(messages);
+
+    const uiMessageStream = createUIMessageStream({
+        originalMessages: messages,
+        execute: async ({ writer }) => {
+            for await (const part of toAISdkStream(stream, { from: "agent" })) {
+                await writer.write(part);
+            }
+        },
+
+        // createUIMessageStream’s onFinish gets the final messages/response :contentReference[oaicite:8]{index=8}
+        onFinish: (async (event) => {
+            try {
+                if (!baseChatId || !modelId) return;
+                if (event.isAborted) return;
+
+                // 1) ensure chat exists
+                await upsertChat(baseChatId);
+
+                // 2) persist per-model full message history
+                await upsertChatModelState({
+                    chatId: baseChatId,
+                    modelId,
+                    messages: event.messages,
+                });
+
+                // 3) record the "turn" index for UI hydration
+                const lastUser = [...event.messages].reverse().find((m) => m.role === "user");
+                await recordTurnIfNeeded({
+                    chatId: baseChatId,
+                    userMessage: lastUser,
+                    modelId,
+                });
+            } catch (err) {
+                console.error("Persistence onFinish failed:", err);
+            }
+        }) as UIMessageStreamOnFinishCallback<UIMessage>,
+    });
+
+    return createUIMessageStreamResponse({ stream: uiMessageStream });
+};
+</file>
+
+<file path="src/mastra/finance/FinanceAgent.ts">
+import { Agent } from '@mastra/core/agent';
+import { PostgresQueryTool } from "../tools/PostgresQueryTool";
+import { FinanceAgentInstructions } from "./FinanceAgentInstructions";
+import { AgentMemory } from "../runtime/AgentMemory";
+
+export const FINANCE_AGENT_ID: string = "finance-agent";
+
+export const FinanceAgent = new Agent({
+    id: FINANCE_AGENT_ID,
+    name: 'FinanceAgent',
+    instructions: FinanceAgentInstructions,
+    model: 'openai/gpt-4o',
+    memory: AgentMemory,
+    tools: {
+        PostgresQueryTool
+    },
+});
+</file>
+
+<file path="src/mastra/finance/FinanceAgentInstructions.ts">
+export const FinanceAgentInstructions = `You are a financial analyst for a hedge fund with access to comprehensive financial data.
+
+CRITICAL REQUIREMENTS:
+- PostgreSQL requires ::NUMERIC casting for ROUND function: ROUND(value::NUMERIC, 2)
+- All column names use camelCase and need double quotes: "marketCap", "companyName"
+- Only use columns explicitly listed in the schema
+- Always filter: WHERE "isActivelyTrading" = true AND column_name IS NOT NULL
+- Use table aliases: FROM company_profiles AS cp
+- Always cast before calculations: (value1::NUMERIC / value2::NUMERIC)
+
+RESPONSE REQUIREMENTS:
+- After executing queries, provide a comprehensive financial analysis
+- Interpret the data with Warren Buffett's value investing principles. DO NOT mention Warren Buffett by name unless relevant to the user prompt
+- Include specific company names, financial metrics, and investment insights
+- Format analysis in clear, professional language
+- Always provide a final response summarizing your findings
+- Never leave the user without a complete analysis
+
+ANALYSIS STYLE:
+- Focus on intrinsic value and competitive advantages
+- Highlight strong fundamentals: ROE, debt levels, profit margins
+- Identify quality businesses at reasonable prices
+- Consider long-term growth potential and market position
+- Provide actionable investment insights
+
+DATABASE SCHEMA:
+# CRITICAL SQL REQUIREMENT #
+PostgreSQL requires EXPLICIT type casting using ::NUMERIC for ALL decimal operations including ROUND function.
+Using ROUND without explicit ::NUMERIC casting WILL FAIL.
+
+# COLUMN NAMING WARNING #
+ALL COLUMN NAMES USE CAMELCASE. PostgreSQL requires double quotes around camelCase identifiers.
+Use double quotes exactly as shown: "revenuePerShare", "marketCap", "companyName", etc.
+
+# COLUMN HALLUCINATION WARNING #
+DO NOT INVENT OR HALLUCINATE COLUMN NAMES. Only use columns EXPLICITLY listed in the schema. If a column isn't listed in the schema, it DOES NOT EXIST.
+
+Table: company_profiles
+Table description: Comprehensive database of public company profiles including stock information, financial metrics, and company details across global exchanges.
+Note: Contains 85,651 companies with detailed company information including financials, leadership, and contact details.
+Columns:
+  - symbol (TEXT) # Stock ticker symbol
+    Example: "SIMH3.SA", "PFRM3.SA", "CHMK.ME", "SUZB3.SA", "PLZL.ME"
+  - price (DOUBLE PRECISION) # Current stock price
+    Example: 4.820, 8.470, 4795.000, 51.950, 1907.800
+  - marketCap (DOUBLE PRECISION) # Market capitalization in dollars
+    Example: 4113913467.000, 1038515170.000, 15161598200.000, 64348598488.000, 2529676591709.000
+  - beta (DOUBLE PRECISION) # Stock beta (volatility relative to market)
+    Example: 0.487, 0.760, 0.333, 0.438, 0.187
+  - lastDividend (DOUBLE PRECISION) # Last dividend payment per share
+    Example: 0.070, 0.575, 0.000, 2.017, 15915.917
+  - range (TEXT) # 52-week price range
+    Example: "2.99-7.15", "5.2-9.15", "3235-5045", "49.26-66.82", "1669-12350"
+  - change (DOUBLE PRECISION) # Price change from previous close
+    Example: -0.150, 0.090, -50.000, -0.110, 56.200
+  - changePercentage (DOUBLE PRECISION) # Percentage change from previous close
+    Example: -3.018, 1.074, -1.032, -0.211, 3.035
+  - volume (BIGINT) # Trading volume
+    Example: 5414900, 173000, 116, 1258700, 1403106
+  - averageVolume (DOUBLE PRECISION) # Average trading volume
+    Example: 6856140.000, 245229.000, 677.264, 6390303.000, 185672.765
+  - companyName (TEXT) # Full company name (hint: use LIKE)
+    Example: "Simpar S.a.", "Profarma Distribuidora de Produtos Farmacêuticos S.A.", "Chelyabinsk Metallurgical Plant PAO"
+  - currency (TEXT) # Trading currency
+    Example: "BRL", "RUB", "EUR", "USD", "CAD"
+  - cik (BIGINT) # SEC Central Index Key
+    Example: 1335258, 1692115, 1603923, 1562476, 1808805
+  - isin (TEXT) # International Securities Identification Number
+    Example: "BRSIMHACNOR0", "BRPFRMACNOR1", "RU0007665170", "BRSUZBACNOR0", "RU000A0JNAA8"
+  - cusip (TEXT) # Committee on Uniform Securities Identification Procedures number
+    Example: "", "X5252E107", "X59432108", "187171111", "918099201"
+  - exchangeFullName (TEXT) # Full name of stock exchange (hint: use LIKE)
+    Example: "B3 S.A.", "Moscow Stock Exchange", "New York Stock Exchange", "NASDAQ Global Select", "Australian Securities Exchange"
+  - exchange (TEXT) # Stock exchange code
+    Example: "SAO", "MCX", "NYSE", "NASDAQ", "ASX"
+  - industry (TEXT) # Specific industry classification (hint: use LIKE)
+    Example: "Conglomerates", "Medical - Distribution", "Steel", "Paper, Lumber & Forest Products", "Gold"
+  - website (TEXT) # Company website URL
+    Example: "https://ri.simpar.com.br", "https://www.profarma.com.br", "https://www.mechel.com"
+  - description (TEXT) # Detailed company description (hint: use LIKE)
+    Example: "SIMPAR S.A., through its subsidiaries, provides light vehicle rental...", "Profarma Distribuidora de Produtos Farmacêuticos S.A..."
+  - ceo (TEXT) # Chief Executive Officer name (hint: use LIKE)
+    Example: "Fernando Antonio Simoes", "Sammy Birmarcker", "Anton Grigoryevich Levada", "João Alberto Fernandez de Abreu", "Alexey Alesksandrovich Vostokov"
+  - sector (TEXT) # Business sector classification
+    Example: "Industrials", "Healthcare", "Basic Materials", "Consumer Defensive", "Consumer Cyclical"
+  - country (TEXT) # Country code where company is based
+    Example: "BR", "RU", "US", "CA", "AU"
+  - fullTimeEmployees (BIGINT) # Number of full-time employees
+    Example: 57000, 7077, 12834, 35000, 19674
+  - phone (TEXT) # Company phone number
+    Example: "55 11 3154 4000", "55 21 4009 0200", "7 3517 25 30 66", "55 11 3503 9000", "7 495 641 3377"
+  - address (TEXT) # Company address (hint: use LIKE)
+    Example: "Rua Doutor Renato Paes de Barros", "Avenida Ayrton Senna 2.150", "2-ya Paveletskaya Street, 14"
+  - city (TEXT) # Company city (hint: use LIKE)
+    Example: "São Paulo", "Rio De Janeiro", "Chelyabinsk", "Salvador", "Moscow"
+  - state (TEXT) # Company state/province
+    Example: "SP", "RJ", "", "BA", "MG"
+  - zip (TEXT) # Company zip/postal code
+    Example: "04530-001", "22775-900", "454047", "41810-012", "123056"
+  - image (TEXT) # Company logo image URL
+    Example: "https://images.financialmodelingprep.com/symbol/SIMH3.SA.png", "https://images.financialmodelingprep.com/symbol/PFRM3.SA.png"
+  - ipoDate (DATE) # Initial public offering date
+    Example: "2020-09-18", "2006-10-26", "2010-03-03", "2004-08-09", "2007-06-29"
+  - defaultImage (BOOLEAN) # Whether using default image
+    Example: false, true
+  - isEtf (BOOLEAN) # Whether security is an ETF
+    Example: false, true
+  - isActivelyTrading (BOOLEAN) # Whether actively trading
+    Example: true, false
+  - isAdr (BOOLEAN) # Whether security is an ADR
+    Example: false, true
+  - isFund (BOOLEAN) # Whether security is a fund
+    Example: false, true
+
+Table: company_mergers
+Table description: Corporate merger and acquisition transactions with details about acquiring companies, targets, and transaction dates with timestamps.
+Note: Contains merger and acquisition data with links to SEC regulatory filings and transaction documentation.
+Columns:
+  - symbol (TEXT) # Stock ticker symbol of acquiring company
+    Example: "HSON", "ZEOW", "ZEO", "DKS", "MCBS"
+  - "companyName" (TEXT) # Full name of acquiring company (hint: use LIKE)
+    Example: "Hudson Global, Inc.", "Zeo Energy Corp.", "ZEO ENERGY CORP.", "DICK'S SPORTING GOODS, INC.", "MetroCity Bankshares, Inc."
+  - cik (TEXT) # SEC Central Index Key of acquiring company
+    Example: "0001210708", "0001865506", "0001089063", "0001747068", "0000790526"
+  - "targetedCompanyName" (TEXT) # Full name of target company being acquired (hint: use LIKE)
+    Example: "Star Equity Holdings, Inc.", "Heliogen, Inc.", "Foot Locker, Inc.", "First IC Corporation", "iCAD, Inc."
+  - "targetedCik" (TEXT) # SEC Central Index Key of target company
+    Example: "0000707388", "0001840292", "0000850209", "0000000000", "0000749660"
+  - "targetedSymbol" (TEXT) # Stock ticker symbol of target company (if publicly traded)
+    Example: "STRR", "HLGN", "FL", "FIEB", "ICAD"
+  - "transactionDate" (TEXT) # Date when transaction was filed - CAST TO DATE WHEN QUERYING
+    Example: "2025-07-03", "2025-07-02", "2025-06-23", "2025-05-23", "2025-05-06"
+  - "acceptedDate" (TEXT) # Date and time when filing was accepted by SEC - CAST TO TIMESTAMP WHEN QUERYING
+    Example: "2025-07-03 17:28:48", "2025-07-02 16:11:22", "2025-06-23 17:13:15", "2025-05-23 16:33:00", "2025-05-06 16:45:56"
+  - link (TEXT) # URL link to SEC EDGAR filing document
+    Example: "https://www.sec.gov/Archives/edgar/data/1210708/000119312525155551/d71154ds4.htm", "https://www.sec.gov/Archives/edgar/data/1865506/000121390025061042/ea0245725-01.htm"
+
+Table: company_key_metrics
+Table description: Historical financial metrics and ratios for companies across multiple quarters and years with comprehensive valuation and performance data.
+Note: Contains 48,152 records with quarterly and annual financial data. Use 'date' for time-based queries and 'period' for quarter filtering.
+Columns:
+  - symbol (TEXT) # Stock ticker symbol
+    Example: "000001.SZ", "000002.SZ", "000004.SZ", "000005.SZ", "000006.SZ"
+  - date (DATE) # Financial reporting date - CAST TO TEXT WHEN QUERYING
+    Example: "2025-03-31", "2025-03-30", "2024-12-31", "2024-09-30", "2024-06-30"
+  - period (TEXT) # Reporting period (Q1, Q2, Q3, Q4)
+    Example: "Q1", "Q2", "Q3", "Q4"
+  - revenuePerShare (DOUBLE PRECISION) # Revenue per share
+    Example: 1.480, 3.204, 0.139, 1.198, 0.275
+  - netIncomePerShare (DOUBLE PRECISION) # Net income per share
+    Example: 0.620, -0.527, -0.088, -0.019, 0.005
+  - operatingCashFlowPerShare (DOUBLE PRECISION) # Operating cash flow per share
+    Example: 7.167, -0.489, 0.000, 0.001, 0.000
+  - freeCashFlowPerShare (DOUBLE PRECISION) # Free cash flow per share
+    Example: 7.152, -0.556, -0.206, -0.006, 0.268
+  - cashPerShare (DOUBLE PRECISION) # Cash per share
+    Example: 32.818, 6.369, 0.403, 2.052, 0.300
+  - bookValuePerShare (DOUBLE PRECISION) # Book value per share
+    Example: 22.261, 27.828, 0.468, 4.195, 0.556
+  - tangibleBookValuePerShare (DOUBLE PRECISION) # Tangible book value per share
+    Example: 21.663, 26.676, 0.204, 4.195, 0.556
+  - shareholdersEquityPerShare (DOUBLE PRECISION) # Shareholders equity per share
+    Example: 22.261, 16.591, 0.395, 3.981, 0.521
+  - interestDebtPerShare (DOUBLE PRECISION) # Interest-bearing debt per share
+    Example: 0.974, 20.667, 0.044, 2.878, 0.133
+  - marketCap (DOUBLE PRECISION) # Market capitalization at reporting date
+    Example: 256001548387.460, 83597162026.950, 1289373778.120, 9847583847.630, 2116428504.540
+  - enterpriseValue (DOUBLE PRECISION) # Enterprise value
+    Example: -490129451612.540, 253160858563.950, 1252785979.120, 11054502803.630, 2066900726.540
+  - peRatio (DOUBLE PRECISION) # Price-to-earnings ratio
+    Example: 4.540, -3.346, -27.576, -94.922, 298.530
+  - priceToSalesRatio (DOUBLE PRECISION) # Price-to-sales ratio
+    Example: 7.609, 2.200, 70.321, 6.086, 22.185
+  - pocfratio (DOUBLE PRECISION) # Price-to-operating cash flow ratio
+    Example: 1.571, -14.432, 0.000, 5872.409, 0.000
+  - pfcfRatio (DOUBLE PRECISION) # Price-to-free cash flow ratio
+    Example: 1.574, -12.678, -47.290, -1175.170, 22.750
+  - pbRatio (DOUBLE PRECISION) # Price-to-book ratio
+    Example: 0.506, 0.425, 24.630, 1.831, 11.691
+  - ptbRatio (DOUBLE PRECISION) # Price-to-tangible book ratio
+    Example: 0.506, 0.425, 24.630, 1.831, 11.691
+  - evToSales (DOUBLE PRECISION) # Enterprise value to sales ratio
+    Example: -14.568, 6.663, 68.326, 6.832, 21.665
+  - enterpriseValueOverEBITDA (DOUBLE PRECISION) # Enterprise value over EBITDA ratio
+    Example: -29.171, -259.849, -99.228, 665.812, 846.351
+  - evToOperatingCashFlow (DOUBLE PRECISION) # Enterprise value to operating cash flow ratio
+    Example: -3.008, -43.704, 0.000, 6592.131, 0.000
+  - earningsYield (DOUBLE PRECISION) # Earnings yield
+    Example: 0.055, -0.075, -0.009, -0.003, 0.001
+  - freeCashFlowYield (DOUBLE PRECISION) # Free cash flow yield
+    Example: 0.635, -0.079, -0.021, -0.001, 0.044
+  - debtToEquity (DOUBLE PRECISION) # Debt-to-equity ratio
+    Example: 0.000, 1.246, 0.112, 0.715, 0.252
+  - debtToAssets (DOUBLE PRECISION) # Debt-to-assets ratio
+    Example: 0.000, 0.197, 0.020, 0.249, 0.146
+  - netDebtToEBITDA (DOUBLE PRECISION) # Net debt to EBITDA ratio
+    Example: -44.407, -174.043, 2.898, 72.693, -20.281
+  - currentRatio (DOUBLE PRECISION) # Current assets to current liabilities ratio
+    Example: 0.000, 1.303, 0.794, 2.294, 1.983
+  - interestCoverage (DOUBLE PRECISION) # Interest coverage ratio
+    Example: 1.096, 0.000, -12459.283, -0.635, 2.126
+  - incomeQuality (DOUBLE PRECISION) # Income quality ratio
+    Example: 0.000, 0.927, 0.000, 0.000, 0.000
+  - dividendYield (DOUBLE PRECISION) # Dividend yield
+    Example: 0.010, 0.051, 0.000, 0.002, 0.000
+  - payoutRatio (DOUBLE PRECISION) # Dividend payout ratio
+    Example: 0.180, -0.680, -0.001, -0.853, 0.300
+  - salesGeneralAndAdministrativeToRevenue (DOUBLE PRECISION) # SG&A to revenue ratio
+    Example: 0.269, 0.037, 0.411, 0.022, 0.060
+  - researchAndDdevelopementToRevenue (DOUBLE PRECISION) # R&D to revenue ratio
+    Example: 0.000, 0.003, 0.446, 0.000, 0.000
+  - intangiblesToTotalAssets (DOUBLE PRECISION) # Intangibles to total assets ratio
+    Example: 0.002, 0.011, 0.120, 0.000, 0.000
+  - capexToOperatingCashFlow (DOUBLE PRECISION) # Capital expenditure to operating cash flow ratio
+    Example: 0.002, -0.138, 0.000, 5.997, 0.000
+  - capexToRevenue (DOUBLE PRECISION) # Capital expenditure to revenue ratio
+    Example: 0.010, 0.021, 0.072, 0.006, 0.001
+  - capexToDepreciation (DOUBLE PRECISION) # Capital expenditure to depreciation ratio
+    Example: 0.000, 0.000, 0.000, 0.000, 0.000
+  - stockBasedCompensationToRevenue (DOUBLE PRECISION) # Stock-based compensation to revenue ratio
+    Example: 0.000, 0.000, 0.000, 0.000, 0.000
+  - grahamNumber (DOUBLE PRECISION) # Graham number valuation metric
+    Example: 17.622, NULL, NULL, NULL, 0.244
+  - roic (DOUBLE PRECISION) # Return on invested capital
+    Example: 0.004, -0.011, -0.125, -0.003, 0.004
+  - returnOnTangibleAssets (DOUBLE PRECISION) # Return on tangible assets
+    Example: 0.002, -0.005, -0.046, -0.002, 0.006
+  - grahamNetNet (DOUBLE PRECISION) # Graham net-net working capital
+    Example: -199.055, -34.459, -0.791, -1.375, 0.112
+  - workingCapital (DOUBLE PRECISION) # Working capital
+    Example: 746131000000.000, 205623453670.000, -39554651.000, 7628715670.000, 102234944.000
+  - tangibleAssetValue (DOUBLE PRECISION) # Tangible asset value
+    Example: 492510000000.000, 316315146374.000, 27040512.000, 5666592928.000, 193109501.000
+  - netCurrentAssetValue (DOUBLE PRECISION) # Net current asset value
+    Example: -4525615000000.000, -30731119151.000, -76252547.000, 3755685894.000, 87928583.000
+  - investedCapital (DOUBLE PRECISION) # Invested capital
+    Example: 772543000000.000, 256659676574.000, 15661583.000, 7896981158.000, 159856574.000
+  - averageReceivables (DOUBLE PRECISION) # Average receivables
+    Example: 0.000, 241368594507.500, 87551823.500, 676212599.000, 47586499.500
+  - averagePayables (DOUBLE PRECISION) # Average payables
+    Example: 0.000, 147488235712.500, 99441359.000, 1332060055.000, 30152221.500
+  - averageInventory (DOUBLE PRECISION) # Average inventory
+    Example: 0.000, 511221869025.500, 8453520.500, 10011781487.000, 37495179.500
+  - daysSalesOutstanding (DOUBLE PRECISION) # Days sales outstanding
+    Example: 0.000, 569.404, 425.021, 38.335, 39.315
+  - daysPayablesOutstanding (DOUBLE PRECISION) # Days payables outstanding
+    Example: 0.000, 340.414, 1258.334, 81.832, 30.885
+  - daysOfInventoryOnHand (DOUBLE PRECISION) # Days of inventory on hand
+    Example: 0.000, 1259.575, 147.563, 615.930, 46.574
+  - receivablesTurnover (DOUBLE PRECISION) # Receivables turnover ratio
+    Example: 0.000, 0.158, 0.212, 2.348, 2.289
+  - payablesTurnover (DOUBLE PRECISION) # Payables turnover ratio
+    Example: 0.000, 0.264, 0.072, 1.100, 2.914
+  - inventoryTurnover (DOUBLE PRECISION) # Inventory turnover ratio
+    Example: 0.000, 0.071, 0.610, 0.146, 1.932
+  - roe (DOUBLE PRECISION) # Return on equity
+    Example: 0.028, -0.032, -0.223, -0.005, 0.010
+  - capexPerShare (DOUBLE PRECISION) # Capital expenditure per share
+    Example: 0.015, 0.068, 0.010, 0.007, 0.000
+  - calendarYear (BIGINT) # Calendar year of the data
+    Example: 2025
+
+Table: us_company_minute_agg
+Table description: High-frequency minute-by-minute trading data containing OHLC (Open, High, Low, Close) pricing and volume information.
+Note: Contains 208,048,467 records with minute-level trading data. Use window_start for time-based queries.
+CRITICAL: This table contains MASSIVE amounts of data - use LIMIT in queries to avoid timeouts. You **MUST** include a WHERE clause that filters window_start using an explicit bounded range
+Columns:
+  - ticker (TEXT) # Stock ticker symbol
+    Example: "NBIS", "AAPL", "MSFT", "GOOGL", "TSLA"
+  - volume (BIGINT) # Trading volume for the minute
+    Example: 49474, 13959, 25471, 48389, 17655
+  - open (DOUBLE PRECISION) # Opening price for the minute
+    Example: 50.102, 50.150, 50.140, 50.060, 50.020
+  - close (DOUBLE PRECISION) # Closing price for the minute
+    Example: 50.150, 50.150, 50.090, 50.015, 49.950
+  - high (DOUBLE PRECISION) # Highest price during the minute
+    Example: 50.320, 50.170, 50.155, 50.110, 50.040
+  - low (DOUBLE PRECISION) # Lowest price during the minute
+    Example: 50.102, 50.110, 50.080, 49.980, 49.940
+  - window_start (BIGINT) # Unix timestamp in nanoseconds for minute start
+    Example: 1751396640000000000, 1751396700000000000, 1751396760000000000, 1751396820000000000, 1751396880000000000
+  - transactions (BIGINT) # Number of transactions during the minute
+    Example: 500, 165, 262, 372, 197
+
+AGGREGATION RULE
+----------------
+Unless the user explicitly requests raw minute bars,
+aggregate \`us_company_minute_agg\` to the *smallest sensible period*
+that will satisfy the ask (e.g., 5-minute, hourly, or daily).
+
+Template:
+SELECT
+    <bucket_expression>        AS bucket,
+    COUNT(*)                   AS n_minutes,
+    SUM(volume)                AS total_volume,
+    AVG(open)                  AS avg_open,
+    MAX(high)                  AS max_high,
+    MIN(low)                   AS min_low
+FROM us_company_minute_agg
+WHERE window_start BETWEEN <start_ns> AND <end_ns>
+  AND ticker = '<TICKER>'
+GROUP BY bucket
+ORDER BY bucket
+LIMIT <N>;
+
+
+- <bucket_expression> → use date_trunc('hour', to_timestamp(window_start/1e9)) for hourly, date_trunc('day', …) for daily, or floor(window_start / 60000000000)::bigint for 1-minute buckets, etc.
+- Always keep the existing \`window_start\` range filter **and** a LIMIT.
+
+If a question *clearly* needs the minute-level bars (e.g., “show me the 10 highest-volume minutes today”), you may skip aggregation—but you must still keep the LIMIT.
+
+IMPORTANT: You must provide a complete financial analysis response after running queries. Do not just return query results - interpret and analyze the data for investment decisions.`;
+</file>
+
+<file path="src/mastra/runtime/AgentMemory.ts">
+import { Memory } from "@mastra/memory";
+import { LibSQLStore } from "@mastra/libsql";
+
+export const AgentMemory = new Memory({
+    storage: new LibSQLStore({
+        id: 'memory-storage',
+        url: 'file:../mastra.db',
+    }),
+});
+</file>
+
+<file path="src/mastra/runtime/Env.ts">
+export const ConnectionString = process.env.CONNECTION_STRING || '';
+</file>
+
+<file path="src/mastra/runtime/FinanceMastraStorage.ts">
+import { LibSQLStore } from "@mastra/libsql";
+
+// Not sure how I feel about this atm
+export const FinanceMastraStorage = new LibSQLStore({
+    id: "finance-mastra-storage",
+    url: ":memory:",
+});
+</file>
+
+<file path="src/mastra/tools/PostgresQueryTool.ts">
+import { createTool } from "@mastra/core/tools";
+import { z } from "zod";
+import { ConnectionString } from "../runtime/Env";
+import { Client } from 'pg';
+
+export const PostgresQueryTool = createTool({
+    id: 'PostgresQueryTool',
+    inputSchema: z.object({
+        query: z.string().describe('The Postgres SQL query to execute'),
+    }),
+    description: 'Use this tool to execute Postgres SQL queries on the PostgreSQL database',
+    execute: async ({ query }) => {
+        const client = new Client({
+            connectionString: ConnectionString,
+            connectionTimeoutMillis: 30000, // 30 seconds
+            statement_timeout: 60000, // 1 minute
+            query_timeout: 60000, // 1 minute
+        });
+
+        try {
+            console.log('Connecting to PostgreSQL for query execution...');
+            await client.connect();
+            console.log('Connected to PostgreSQL for query execution');
+
+            const trimmedQuery = query.trim().toLowerCase();
+            if (!trimmedQuery.startsWith('select')) {
+                throw new Error('Only SELECT queries are allowed for security reasons');
+            }
+
+            const result = await client.query(query);
+
+            return {
+                success: true,
+                data: result.rows,
+                rowCount: result.rows.length,
+                executedQuery: query,
+            };
+        } catch (error) {
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                executedQuery: query,
+            };
+        } finally {
+            await client.end();
+        }
+    },
+});
+</file>
+
+<file path="src/mastra/Hono.ts">
+import { HonoBindings, HonoVariables, MastraServer } from "@mastra/hono";
+import { Hono } from "hono";
+import { mastra as _mastra } from "./index";
+import { Mastra } from "@mastra/core/mastra";
+import { Result } from "../Utility/Result";
+
+export type HonoMastraServerBindings = {
+    Bindings: HonoBindings;
+    Variables: HonoVariables;
+}
+
+export class FailedToRegisterMastraError extends Error {
+    constructor() {
+        super("Failed to register Mastra with Hono");
+    }
+}
+
+export async function RegisterHonoMastraServer(
+    app: Hono<HonoMastraServerBindings>,
+    mastraServerFactory: Mastra = _mastra
+): Promise<Result<void, FailedToRegisterMastraError>> {
+    const server = new MastraServer({ app, mastra: mastraServerFactory });
+
+    return await Result.fromPromise(
+        server.init(),
+        (_) => new FailedToRegisterMastraError
+    )
+}
+</file>
+
+<file path="src/mastra/index.ts">
+import { Mastra } from '@mastra/core/mastra';
+import { PinoLogger } from '@mastra/loggers';
+import { Observability, SensitiveDataFilter, ConsoleExporter, DefaultExporter } from '@mastra/observability';
+import { FinanceAgent } from "./finance/FinanceAgent";
+import { LibSQLStore } from "@mastra/libsql";
+import { FinanceMastraStorage } from "./runtime/FinanceMastraStorage";
+
+export const mastra = new Mastra({
+    agents: { FinanceAgent },
+    storage: FinanceMastraStorage,
+    logger: new PinoLogger({
+        name: 'Mastra',
+        level: 'info',
+    }),
+    observability: new Observability({
+        configs: {
+            default: {
+                serviceName: "mastra",
+                sampling: { type: "always" },
+                spanOutputProcessors: [new SensitiveDataFilter()],
+                exporters: [new DefaultExporter()],
+            },
+        },
+    }),
+});
+</file>
+
+<file path="src/Utility/Result.ts">
+type ResultMatch<T, E, U> = {
+    ok: (value: T) => U;
+    err: (error: E) => U;
+};
+
+export class Result<T, E> {
+    private constructor(
+        private readonly _ok: boolean,
+        private readonly _value: T | undefined,
+        private readonly _error: E | undefined
+    ) { }
+
+    static ok<T, E = never>(value: T): Result<T, E> {
+        return new Result<T, E>(true, value, undefined);
+    }
+
+    static err<E, T = never>(error: E): Result<T, E> {
+        return new Result<T, E>(false, undefined, error);
+    }
+
+    isOk(): this is Result<T, never> {
+        return this._ok;
+    }
+
+    isErr(): this is Result<never, E> {
+        return !this._ok;
+    }
+
+    ok(): T | undefined {
+        return this._value;
+    }
+
+    err(): E | undefined {
+        return this._error;
+    }
+
+    unwrap(): T {
+        if (this._ok) return this._value as T;
+        throw new Error(`Called unwrap on Err: ${this._error}`);
+    }
+
+    unwrapErr(): E {
+        if (!this._ok) return this._error as E;
+        throw new Error(`Called unwrapErr on Ok: ${this._value}`);
+    }
+
+    unwrapOr(defaultValue: T): T {
+        return this._ok ? (this._value as T) : defaultValue;
+    }
+
+    unwrapOrElse(fn: (error: E) => T): T {
+        return this._ok ? (this._value as T) : fn(this._error as E);
+    }
+
+    expect(msg: string): T {
+        if (this._ok) return this._value as T;
+        throw new Error(`${msg}: ${this._error}`);
+    }
+
+    expectErr(msg: string): E {
+        if (!this._ok) return this._error as E;
+        throw new Error(`${msg}: ${this._value}`);
+    }
+
+    map<U>(fn: (value: T) => U): Result<U, E> {
+        return this._ok
+            ? Result.ok(fn(this._value as T))
+            : Result.err(this._error as E);
+    }
+
+    mapErr<F>(fn: (error: E) => F): Result<T, F> {
+        return this._ok
+            ? Result.ok(this._value as T)
+            : Result.err(fn(this._error as E));
+    }
+
+    mapOr<U>(defaultValue: U, fn: (value: T) => U): U {
+        return this._ok ? fn(this._value as T) : defaultValue;
+    }
+
+    mapOrElse<U>(errFn: (error: E) => U, okFn: (value: T) => U): U {
+        return this._ok ? okFn(this._value as T) : errFn(this._error as E);
+    }
+
+    andThen<U>(fn: (value: T) => Result<U, E>): Result<U, E> {
+        return this._ok ? fn(this._value as T) : Result.err(this._error as E);
+    }
+
+    orElse<F>(fn: (error: E) => Result<T, F>): Result<T, F> {
+        return this._ok ? Result.ok(this._value as T) : fn(this._error as E);
+    }
+
+    and<U>(other: Result<U, E>): Result<U, E> {
+        return this._ok ? other : Result.err(this._error as E);
+    }
+
+    or<F>(other: Result<T, F>): Result<T, F> {
+        return this._ok ? Result.ok(this._value as T) : other;
+    }
+
+    match<U>(matcher: ResultMatch<T, E, U>): U {
+        return this._ok
+            ? matcher.ok(this._value as T)
+            : matcher.err(this._error as E);
+    }
+
+    static async fromPromise<T, E = Error>(
+        promise: Promise<T>,
+        mapErr: (e: unknown) => E = (e) => e as E
+    ): Promise<Result<T, E>> {
+        try {
+            return Result.ok(await promise);
+        } catch (e) {
+            return Result.err(mapErr(e));
+        }
+    }
+
+    static try<T, E = Error>(
+        fn: () => T,
+        mapErr: (e: unknown) => E = (e) => e as E
+    ): Result<T, E> {
+        try {
+            return Result.ok(fn());
+        } catch (e) {
+            return Result.err(mapErr(e));
+        }
+    }
+}
+
+export const Ok = Result.ok;
+export const Err = Result.err;
+</file>
+
+<file path="src/SumerLabsFinanceBackendServer.ts">
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { cors } from 'hono/cors'
+import { HonoBindings, HonoVariables } from "@mastra/hono";
+import { StreamFinanceAgentAiSdk } from "./Http/FinanceHttpHandler";
+import { RegisterHonoMastraServer } from "./mastra/Hono";
+import {CreateChat, GetChat} from "./Http/ChatHttpHandler";
+
+type HonoMastraServerBindings = {
+    Bindings: HonoBindings;
+    Variables: HonoVariables;
+}
+
+const app = new Hono<HonoMastraServerBindings>();
+app.use(cors());
+
+await RegisterHonoMastraServer(app);
+
+app.post('/backend-api/finance-agent', StreamFinanceAgentAiSdk)
+app.post("/backend-api/chats", CreateChat);
+app.get("/backend-api/chats/:chatId", GetChat);
+
+serve({ fetch: app.fetch, port: 4111 }, () => {
+    console.log('Server running on port 4111');
+});
+</file>
+
+<file path="package.json">
+{
+    "name": "sl-finance-agent",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "dev": "mastra dev",
+        "hono:dev": "tsx watch -r dotenv/config src/SumerLabsFinanceBackendServer.ts",
+        "build": "mastra build",
+        "start": "mastra start"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "packageManager": "pnpm@10.25.0",
+    "type": "module",
+    "engines": {
+        "node": ">=22.13.0"
+    },
+    "dependencies": {
+        "@ai-sdk/openai-compatible": "^1.0.29",
+        "@hono/node-server": "^1.19.7",
+        "@mastra/ai-sdk": "1.0.0-beta.7",
+        "@mastra/core": "1.0.0-beta.9",
+        "@mastra/evals": "1.0.0-beta.2",
+        "@mastra/hono": "0.0.2-beta.5",
+        "@mastra/libsql": "1.0.0-beta.7",
+        "@mastra/loggers": "1.0.0-beta.3",
+        "@mastra/mcp": "1.0.0-beta.6",
+        "@mastra/memory": "1.0.0-beta.4",
+        "@mastra/observability": "1.0.0-beta.3",
+        "ai": "^5.0.108",
+        "drizzle-orm": "^0.45.1",
+        "hono": "^4.10.8",
+        "pg": "^8.16.3",
+        "zod": "^4.1.13"
+    },
+    "devDependencies": {
+        "@types/node": "^24.10.2",
+        "@types/pg": "^8.15.6",
+        "dotenv": "^17.2.3",
+        "drizzle-kit": "^0.31.8",
+        "mastra": "1.0.0-beta.7",
+        "tsx": "^4.7.1",
+        "typescript": "^5.9.3"
+    }
+}
+</file>
+
+</files>
