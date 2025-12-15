@@ -61,3 +61,19 @@ CREATE TABLE IF NOT EXISTS "chat_artifacts" (
 -- Index Definition
 CREATE INDEX IF NOT EXISTS "chat_artifacts_chat_id_idx"
     ON "chat_artifacts" USING btree ("chat_id" ASC NULLS LAST);
+
+CREATE TABLE IF NOT EXISTS chat_deck_states (
+                                                chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+    deck JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+CREATE INDEX IF NOT EXISTS chat_deck_states_chat_id_idx ON chat_deck_states(chat_id);
+
+CREATE TABLE IF NOT EXISTS chat_doc_states (
+                                               chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+    doc JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+CREATE INDEX IF NOT EXISTS chat_doc_states_chat_id_idx ON chat_doc_states(chat_id);

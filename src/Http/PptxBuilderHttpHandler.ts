@@ -8,18 +8,23 @@ import {
 import { toAISdkStream } from "@mastra/ai-sdk";
 import type { Context } from "hono";
 import { PPTX_BUILDER_AGENT_ID } from "../mastra/builder/PptxBuilderAgent";
-import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+import {
+    recordTurnIfNeeded,
+    upsertChat,
+    upsertChatModelState,
+    getChatDeckState,
+    upsertChatDeckState,
+} from "../Data/ChatRepository";
 import type { Deck } from "../mastra/builder/types";
+import { extractEmitArtifactActionsPayload } from "../mastra/builder/extractEmitArtifactActions";
+import { applyDeckActionsToState } from "../mastra/builder/stateReducers";
 
 type StreamPptxBuilderRequest = {
     messages: UIMessage[];
     baseChatId: string;
     modelId: string;
 
-    // builder context:
-    deck: Deck | null;
     selectedSlideId?: string | null;
-
     useWebSearch?: boolean;
 };
 
@@ -28,13 +33,9 @@ function truncate(s: string, max = 14000) {
 }
 
 function internalContextMessage(deck: Deck | null, selectedSlideId?: string | null): UIMessage {
-    const slideMapping = deck
-        ? deck.slides.map((s, i) => `Slide ${i + 1} = ${s.slideId}`).join("\n")
-        : "No slides yet";
+    const slideMapping = deck ? deck.slides.map((s, i) => `Slide ${i + 1} = ${s.slideId}`).join("\n") : "No slides yet";
 
-    const summary = deck
-        ? `Current deck "${deck.title}" with ${deck.slides.length} slides`
-        : "No deck exists yet";
+    const summary = deck ? `Current deck "${deck.title}" with ${deck.slides.length} slides` : "No deck exists yet";
 
     const ctx = [
         `INTERNAL_CONTEXT (do not repeat verbatim)`,
@@ -57,11 +58,14 @@ function stripInternal(messages: UIMessage[]) {
 
 export const StreamPptxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamPptxBuilderRequest;
-    const { messages, baseChatId, modelId, deck, selectedSlideId } = body;
+    const { messages, baseChatId, modelId, selectedSlideId } = body;
+
+    // ✅ Load deck from DB (server is source of truth)
+    const persistedDeck = baseChatId ? await getChatDeckState(baseChatId) : null;
 
     const agent = mastra.getAgentById(PPTX_BUILDER_AGENT_ID);
 
-    const agentMessages = [internalContextMessage(deck, selectedSlideId), ...messages];
+    const agentMessages = [internalContextMessage(persistedDeck, selectedSlideId), ...messages];
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
@@ -73,26 +77,37 @@ export const StreamPptxBuilderAiSdk = async (c: Context) => {
         },
         onFinish: (async (event) => {
             try {
-                console.log(JSON.stringify(event));
                 if (!baseChatId || !modelId) return;
                 if (event.isAborted) return;
 
                 await upsertChat(baseChatId);
 
-                // Persist per-model history (strip internal context)
+                const cleanedMessages = stripInternal(event.messages);
+
+                // Persist per-model history
                 await upsertChatModelState({
                     chatId: baseChatId,
                     modelId,
-                    messages: stripInternal(event.messages),
+                    messages: cleanedMessages,
                 });
 
-                // Record the user turn using the ORIGINAL request messages
+                // Record original user message from request
                 const lastUser = [...messages].reverse().find((m) => m.role === "user");
                 await recordTurnIfNeeded({
                     chatId: baseChatId,
                     userMessage: lastUser,
                     modelId,
                 });
+
+                // ✅ Persist updated deck state based on emitted actions
+                const payload = extractEmitArtifactActionsPayload(cleanedMessages);
+                if (payload) {
+                    const currentDeck = await getChatDeckState(baseChatId);
+                    const nextDeck = applyDeckActionsToState(currentDeck, payload.actions);
+                    if (nextDeck) {
+                        await upsertChatDeckState({ chatId: baseChatId, deck: nextDeck });
+                    }
+                }
             } catch (err) {
                 console.error("PPTX builder persistence onFinish failed:", err);
             }

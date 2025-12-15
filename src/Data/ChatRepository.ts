@@ -1,7 +1,8 @@
 import type { UIMessage } from "ai";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "./Db";
-import { chats, chatModelStates, chatTurns, chatTurnModels } from "./schema";
+import { chats, chatModelStates, chatTurns, chatTurnModels, chatDeckStates, chatDocStates } from "./schema";
+import type { Deck, Doc } from "../mastra/builder/types";
 
 function stripFilePartsFromMessage(message: UIMessage): UIMessage {
     return {
@@ -77,6 +78,43 @@ export async function recordTurnIfNeeded(params: {
         .onConflictDoNothing();
 }
 
+// ✅ NEW: deck/doc state helpers
+export async function getChatDeckState(chatId: string): Promise<Deck | null> {
+    const row = await db.query.chatDeckStates.findFirst({
+        where: eq(chatDeckStates.chatId, chatId),
+    });
+    return (row?.deck as Deck) ?? null;
+}
+
+export async function upsertChatDeckState(params: { chatId: string; deck: Deck }) {
+    const { chatId, deck } = params;
+    await db
+        .insert(chatDeckStates)
+        .values({ chatId, deck })
+        .onConflictDoUpdate({
+            target: chatDeckStates.chatId,
+            set: { deck, updatedAt: new Date() },
+        });
+}
+
+export async function getChatDocState(chatId: string): Promise<Doc | null> {
+    const row = await db.query.chatDocStates.findFirst({
+        where: eq(chatDocStates.chatId, chatId),
+    });
+    return (row?.doc as Doc) ?? null;
+}
+
+export async function upsertChatDocState(params: { chatId: string; doc: Doc }) {
+    const { chatId, doc } = params;
+    await db
+        .insert(chatDocStates)
+        .values({ chatId, doc })
+        .onConflictDoUpdate({
+            target: chatDocStates.chatId,
+            set: { doc, updatedAt: new Date() },
+        });
+}
+
 export async function getChatById(chatId: string) {
     const chatRow = await db.query.chats.findFirst({
         where: eq(chats.id, chatId),
@@ -142,9 +180,15 @@ export async function getChatById(chatId: string) {
         modelMessages[ms.modelId] = ms.messages as UIMessage[];
     }
 
+    // ✅ NEW: hydrate persisted artifacts
+    const deck = await getChatDeckState(chatId);
+    const doc = await getChatDocState(chatId);
+
     return {
         chatId,
         turns,
         modelMessages,
+        deck,
+        doc,
     };
 }
