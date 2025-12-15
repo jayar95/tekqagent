@@ -4,9 +4,15 @@ import { Observability, SensitiveDataFilter, ConsoleExporter, DefaultExporter } 
 import { FinanceAgent } from "./finance/FinanceAgent";
 import { LibSQLStore } from "@mastra/libsql";
 import { FinanceMastraStorage } from "./runtime/FinanceMastraStorage";
+import { PptxBuilderAgent } from "./builder/PptxBuilderAgent";
+import { DocxBuilderAgent } from "./builder/DocxBuilderAgent";
 
 export const mastra = new Mastra({
-    agents: { FinanceAgent },
+    agents: {
+        FinanceAgent,
+        PptxBuilderAgent,
+        DocxBuilderAgent,
+    },
     storage: FinanceMastraStorage,
     logger: new PinoLogger({
         name: 'Mastra',

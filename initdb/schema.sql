@@ -41,3 +41,23 @@ create table if not exists chat_turn_models (
 
 create index if not exists chat_turn_models_chat_turn_idx
     on chat_turn_models(chat_id, user_message_id);
+
+CREATE TABLE IF NOT EXISTS "chat_artifacts" (
+                                                "chat_id" text NOT NULL,
+                                                "artifact_type" text NOT NULL, -- "docx" | "pptx"
+                                                "state" jsonb NOT NULL,
+                                                "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+
+    -- Primary Key Constraint
+    CONSTRAINT "chat_artifacts_pkey" PRIMARY KEY ("chat_id", "artifact_type"),
+
+    -- Foreign Key Constraint
+    CONSTRAINT "chat_artifacts_chat_id_fkey" FOREIGN KEY ("chat_id")
+    REFERENCES "chats"("id")
+                           ON DELETE CASCADE
+    );
+
+-- Index Definition
+CREATE INDEX IF NOT EXISTS "chat_artifacts_chat_id_idx"
+    ON "chat_artifacts" USING btree ("chat_id" ASC NULLS LAST);

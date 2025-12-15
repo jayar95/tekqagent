@@ -1,9 +1,8 @@
 version: "3.9"
 
 services:
-  postgres:
+  chats_postgres:
     image: pgvector/pgvector:pg18-trixie
-    container_name: postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -12,7 +11,7 @@ services:
       - "5432:5432"
     volumes:
       - ./initdb:/docker-entrypoint-initdb.d
-      - pg:/data/postgres
+      - chats_pg:/data/postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d chats"]
       interval: 5s
@@ -21,4 +20,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  pg:
+  chats_pg:

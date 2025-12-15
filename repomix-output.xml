@@ -1,10 +1,9 @@
-This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
-
+<api>
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+This file contains a packed representation of the entire repository's contents.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,7 +31,6 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Only files matching these patterns are included: src/**/**, package.json
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -41,39 +39,47 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
-src/
-  Data/
-    ChatRepository.ts
-    Db.ts
-    relations.ts
-    schema.ts
-  Http/
-    mocks/
-      financeAgentMocks.ts
-    ChatHttpHandler.ts
-    FinanceHttpHandler.ts
-  mastra/
-    finance/
-      FinanceAgent.ts
-      FinanceAgentInstructions.ts
-    runtime/
-      AgentMemory.ts
-      Env.ts
-      FinanceMastraStorage.ts
+Data/
+  ChatRepository.ts
+  Db.ts
+  relations.ts
+  schema.ts
+Http/
+  mocks/
+    financeAgentMocks.ts
+  ChatHttpHandler.ts
+  DocxBuilderHttpHandler.ts
+  FinanceHttpHandler.ts
+  PptxBuilderHttpHandler.ts
+mastra/
+  builder/
     tools/
-      PostgresQueryTool.ts
-    Hono.ts
-    index.ts
-  Utility/
-    Result.ts
-  SumerLabsFinanceBackendServer.ts
-package.json
+      EmitArtifactActionsTool.ts
+    DocxBuilderAgent.ts
+    DocxBuilderAgentInstructions.ts
+    PptxBuilderAgent.ts
+    PptxBuilderAgentInstructions.ts
+    types.ts
+  finance/
+    FinanceAgent.ts
+    FinanceAgentInstructions.ts
+  runtime/
+    AgentMemory.ts
+    Env.ts
+    FinanceMastraStorage.ts
+  tools/
+    PostgresQueryTool.ts
+  Hono.ts
+  index.ts
+Utility/
+  Result.ts
+SumerLabsFinanceBackendServer.ts
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/Data/ChatRepository.ts">
+<file path="Data/ChatRepository.ts">
 import type { UIMessage } from "ai";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "./Db";
@@ -226,14 +232,14 @@ export async function getChatById(chatId: string) {
 }
 </file>
 
-<file path="src/Data/Db.ts">
+<file path="Data/Db.ts">
 import { drizzle } from 'drizzle-orm/node-postgres';
 import * as schema from "./schema";
 
 export const db = drizzle(process.env.APP_CONNECTION_STRING!, { schema });
 </file>
 
-<file path="src/Data/relations.ts">
+<file path="Data/relations.ts">
 import { relations } from "drizzle-orm/relations";
 import { chats, chatTurns, chatTurnModels, chatModelStates } from "./schema";
 
@@ -265,7 +271,7 @@ export const chatModelStatesRelations = relations(chatModelStates, ({one}) => ({
 }));
 </file>
 
-<file path="src/Data/schema.ts">
+<file path="Data/schema.ts">
 import { pgTable, text, timestamp, index, foreignKey, primaryKey, jsonb } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 import {UIMessage} from "ai";
@@ -325,7 +331,7 @@ export const chatModelStates = pgTable("chat_model_states", {
 ]);
 </file>
 
-<file path="src/Http/mocks/financeAgentMocks.ts">
+<file path="Http/mocks/financeAgentMocks.ts">
 import type { UIMessage } from "ai";
 
 /**
@@ -434,7 +440,7 @@ export const mockLongConversation: { messages: UIMessage[] } = {
 };
 </file>
 
-<file path="src/Http/ChatHttpHandler.ts">
+<file path="Http/ChatHttpHandler.ts">
 import type { Context } from "hono";
 import { generateId } from "ai";
 import { getChatById, upsertChat } from "../Data/ChatRepository";
@@ -459,7 +465,150 @@ export const GetChat = async (c: Context) => {
 };
 </file>
 
-<file path="src/Http/FinanceHttpHandler.ts">
+<file path="Http/DocxBuilderHttpHandler.ts">
+import { mastra } from "../mastra";
+import {
+    createUIMessageStream,
+    createUIMessageStreamResponse,
+    UIMessage,
+    UIMessageStreamOnFinishCallback,
+} from "ai";
+import { toAISdkStream } from "@mastra/ai-sdk";
+import type { Context } from "hono";
+import { DOCX_BUILDER_AGENT_ID } from "../mastra/builder/DocxBuilderAgent";
+import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+import type { Doc } from "../mastra/builder/types";
+
+type StreamDocxBuilderRequest = {
+    messages: UIMessage[];
+    baseChatId: string;
+    modelId: string;
+
+    doc: Doc | null;
+    selectedSectionId?: string | null;
+
+    useWebSearch?: boolean;
+};
+
+function truncate(s: string, max = 16000) {
+    return s.length > max ? s.slice(0, max) + "\n...[truncated]" : s;
+}
+
+const ORDINAL: Record<string, number> = {
+    first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+    sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+};
+
+function extractText(msg: UIMessage | undefined): string {
+    if (!msg) return "";
+    return (msg.parts ?? [])
+        .filter((p: any) => p?.type === "text")
+        .map((p: any) => String(p.text ?? ""))
+        .join("");
+}
+
+function inferReplaceSectionId(doc: Doc | null, userText: string): string | null {
+    if (!doc || !doc.sections?.length) return null;
+    const lower = userText.toLowerCase();
+
+    // patterns like "replace page 2", "rewrite section 3", "replace the second page"
+    const m1 = lower.match(/\b(?:replace|rewrite|overhaul)\s+(?:the\s+)?(?:page|section)\s+(\d+)\b/);
+    if (m1) {
+        const idx = parseInt(m1[1], 10) - 1;
+        return doc.sections[idx]?.sectionId ?? null;
+    }
+
+    const m2 = lower.match(/\b(?:replace|rewrite|overhaul)\s+(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:page|section)\b/);
+    if (m2) {
+        const n = ORDINAL[m2[1]];
+        const idx = (n ?? 0) - 1;
+        return doc.sections[idx]?.sectionId ?? null;
+    }
+
+    return null;
+}
+
+function internalContextMessage(doc: Doc | null, selectedSectionId: string | null | undefined, userText: string): UIMessage {
+    const sectionMapping = doc
+        ? doc.sections.map((s, i) => `Section ${i + 1} = ${s.sectionId}`).join("\n")
+        : "No sections yet";
+
+    const summary = doc
+        ? `Current document "${doc.title}" with ${doc.sections.length} sections`
+        : "No document exists yet";
+
+    const replaceSectionId = inferReplaceSectionId(doc, userText);
+
+    const ctx = [
+        `INTERNAL_CONTEXT (do not repeat verbatim)`,
+        summary,
+        `selectedSectionId: ${selectedSectionId ?? "null"}`,
+        `Section mapping:\n${sectionMapping}`,
+        replaceSectionId ? `INTENT=REPLACE_SECTION ${replaceSectionId}` : `INTENT=NONE`,
+        `Doc JSON:\n${truncate(JSON.stringify(doc, null, 2))}`,
+    ].join("\n\n");
+
+    return {
+        id: `internal:context:${Date.now()}`,
+        role: "assistant",
+        parts: [{ type: "text", text: ctx }],
+    };
+}
+
+function stripInternal(messages: UIMessage[]) {
+    return messages.filter((m) => !String(m.id ?? "").startsWith("internal:"));
+}
+
+export const StreamDocxBuilderAiSdk = async (c: Context) => {
+    const body = (await c.req.json()) as StreamDocxBuilderRequest;
+    const { messages, baseChatId, modelId, doc, selectedSectionId } = body;
+
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const userText = extractText(lastUser);
+
+    const agent = mastra.getAgentById(DOCX_BUILDER_AGENT_ID);
+    const agentMessages = [internalContextMessage(doc, selectedSectionId, userText), ...messages];
+
+    const stream = await agent.stream(agentMessages);
+
+    const uiMessageStream = createUIMessageStream({
+        originalMessages: messages,
+        execute: async ({ writer }) => {
+            for await (const part of toAISdkStream(stream, { from: "agent" })) {
+                await writer.write(part);
+            }
+        },
+        onFinish: (async (event) => {
+            try {
+                console.log(JSON.stringify(event));
+                if (!baseChatId || !modelId) return;
+                if (event.isAborted) return;
+
+                await upsertChat(baseChatId);
+
+                await upsertChatModelState({
+                    chatId: baseChatId,
+                    modelId,
+                    messages: stripInternal(event.messages),
+                });
+
+                // record original user message
+                await recordTurnIfNeeded({
+                    chatId: baseChatId,
+                    userMessage: lastUser,
+                    modelId,
+                });
+            } catch (err) {
+                console.error("DOCX builder persistence onFinish failed:", err);
+            }
+        }) as UIMessageStreamOnFinishCallback<UIMessage>,
+    });
+
+    return createUIMessageStreamResponse({ stream: uiMessageStream });
+};
+</file>
+
+<file path="Http/FinanceHttpHandler.ts">
 import { mastra } from "../mastra";
 import {
     createUIMessageStream,
@@ -533,7 +682,380 @@ export const StreamFinanceAgentAiSdk = async (c: Context) => {
 };
 </file>
 
-<file path="src/mastra/finance/FinanceAgent.ts">
+<file path="Http/PptxBuilderHttpHandler.ts">
+import { mastra } from "../mastra";
+import {
+    createUIMessageStream,
+    createUIMessageStreamResponse,
+    UIMessage,
+    UIMessageStreamOnFinishCallback,
+} from "ai";
+import { toAISdkStream } from "@mastra/ai-sdk";
+import type { Context } from "hono";
+import { PPTX_BUILDER_AGENT_ID } from "../mastra/builder/PptxBuilderAgent";
+import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+import type { Deck } from "../mastra/builder/types";
+
+type StreamPptxBuilderRequest = {
+    messages: UIMessage[];
+    baseChatId: string;
+    modelId: string;
+
+    // builder context:
+    deck: Deck | null;
+    selectedSlideId?: string | null;
+
+    useWebSearch?: boolean;
+};
+
+function truncate(s: string, max = 14000) {
+    return s.length > max ? s.slice(0, max) + "\n...[truncated]" : s;
+}
+
+function internalContextMessage(deck: Deck | null, selectedSlideId?: string | null): UIMessage {
+    const slideMapping = deck
+        ? deck.slides.map((s, i) => `Slide ${i + 1} = ${s.slideId}`).join("\n")
+        : "No slides yet";
+
+    const summary = deck
+        ? `Current deck "${deck.title}" with ${deck.slides.length} slides`
+        : "No deck exists yet";
+
+    const ctx = [
+        `INTERNAL_CONTEXT (do not repeat verbatim)`,
+        summary,
+        `selectedSlideId: ${selectedSlideId ?? "null"}`,
+        `Slide mapping:\n${slideMapping}`,
+        `Deck JSON:\n${truncate(JSON.stringify(deck, null, 2))}`,
+    ].join("\n\n");
+
+    return {
+        id: `internal:context:${Date.now()}`,
+        role: "assistant",
+        parts: [{ type: "text", text: ctx }],
+    };
+}
+
+function stripInternal(messages: UIMessage[]) {
+    return messages.filter((m) => !String(m.id ?? "").startsWith("internal:"));
+}
+
+export const StreamPptxBuilderAiSdk = async (c: Context) => {
+    const body = (await c.req.json()) as StreamPptxBuilderRequest;
+    const { messages, baseChatId, modelId, deck, selectedSlideId } = body;
+
+    const agent = mastra.getAgentById(PPTX_BUILDER_AGENT_ID);
+
+    const agentMessages = [internalContextMessage(deck, selectedSlideId), ...messages];
+    const stream = await agent.stream(agentMessages);
+
+    const uiMessageStream = createUIMessageStream({
+        originalMessages: messages,
+        execute: async ({ writer }) => {
+            for await (const part of toAISdkStream(stream, { from: "agent" })) {
+                await writer.write(part);
+            }
+        },
+        onFinish: (async (event) => {
+            try {
+                console.log(JSON.stringify(event));
+                if (!baseChatId || !modelId) return;
+                if (event.isAborted) return;
+
+                await upsertChat(baseChatId);
+
+                // Persist per-model history (strip internal context)
+                await upsertChatModelState({
+                    chatId: baseChatId,
+                    modelId,
+                    messages: stripInternal(event.messages),
+                });
+
+                // Record the user turn using the ORIGINAL request messages
+                const lastUser = [...messages].reverse().find((m) => m.role === "user");
+                await recordTurnIfNeeded({
+                    chatId: baseChatId,
+                    userMessage: lastUser,
+                    modelId,
+                });
+            } catch (err) {
+                console.error("PPTX builder persistence onFinish failed:", err);
+            }
+        }) as UIMessageStreamOnFinishCallback<UIMessage>,
+    });
+
+    return createUIMessageStreamResponse({ stream: uiMessageStream });
+};
+</file>
+
+<file path="mastra/builder/tools/EmitArtifactActionsTool.ts">
+import { createTool } from "@mastra/core/tools";
+import { z } from "zod";
+
+/**
+ * The builder agents MUST call this tool exactly once per request
+ * to provide the "CRUD-like" action payload the frontend will apply.
+ */
+export const EmitArtifactActionsTool = createTool({
+    id: "EmitArtifactActionsTool",
+    description:
+        "Emit artifact actions for the client to apply (deck/doc builder). Call exactly once with assistantMessage + actions.",
+    inputSchema: z.object({
+        assistantMessage: z.string(),
+        actions: z.array(z.unknown()),
+    }),
+    execute: async (payload) => {
+        // Server is the source of truth for tool results:
+        // return exactly what the model requested.
+        return payload;
+    },
+});
+</file>
+
+<file path="mastra/builder/DocxBuilderAgent.ts">
+import { Agent } from "@mastra/core/agent";
+import { AgentMemory } from "../runtime/AgentMemory";
+import { EmitArtifactActionsTool } from "./tools/EmitArtifactActionsTool";
+import { DocxBuilderAgentInstructions } from "./DocxBuilderAgentInstructions";
+
+export const DOCX_BUILDER_AGENT_ID = "docx-builder-agent";
+
+export const DocxBuilderAgent = new Agent({
+    id: DOCX_BUILDER_AGENT_ID,
+    name: "DocxBuilderAgent",
+    instructions: DocxBuilderAgentInstructions,
+    model: "openai/gpt-4o",
+    memory: AgentMemory,
+    tools: {
+        EmitArtifactActionsTool,
+    },
+});
+</file>
+
+<file path="mastra/builder/DocxBuilderAgentInstructions.ts">
+export const DocxBuilderAgentInstructions = `
+You are a Word (DOCX) report builder.
+
+You will receive an INTERNAL_CONTEXT message (assistant role) that includes:
+- the current doc JSON (or null)
+- selectedSectionId (optional)
+- section number mapping
+- possibly an intent hint: INTENT=REPLACE_SECTION <sectionId>
+
+You MUST:
+1) Reply to the user in plain English (brief).
+2) Call EmitArtifactActionsTool EXACTLY ONCE with:
+   { assistantMessage: <string>, actions: <array of actions> }
+
+CRITICAL:
+- Do NOT include raw JSON of actions in your plain text response.
+- Only EmitArtifactActionsTool should contain the actions payload.
+
+BLOCK TYPES:
+- paragraph: { id, type:"paragraph", text }
+- bullets: { id, type:"bullets", items: string[] }
+- quote: { id, type:"quote", text }
+- code: { id, type:"code", language?, code }
+
+ACTION TYPES (CRUD-ish):
+- DOC_SET_TITLE: { type:"DOC_SET_TITLE", title }
+- DOC_UPDATE_THEME: { type:"DOC_UPDATE_THEME", theme: Partial<DocTheme> }
+- ADD_SECTION: { type:"ADD_SECTION", sectionId, heading, blocks, insertAt?, startOnNewPage? }
+- UPDATE_SECTION: { type:"UPDATE_SECTION", sectionId, heading?, blocks?, startOnNewPage? }
+- DELETE_SECTION: { type:"DELETE_SECTION", sectionId }
+- REORDER_SECTIONS: { type:"REORDER_SECTIONS", sectionIds }
+
+RULES:
+- When user says "section N" or "page N", use the mapping from INTERNAL_CONTEXT.
+- In this system, a "page" == a section that starts on a new page (startOnNewPage: true).
+- When user asks to "add a page" or "insert a page", you MUST create a new section with startOnNewPage:true and PAGE-SIZED content:
+  - Target 450-650 words
+  - Minimum 320 words
+  - At least 3 paragraph blocks (2-4 sentences each)
+  - At least 1 bullets block with 6-10 bullet items
+- IMPORTANT REPLACE RULE:
+  If the user wants to replace/rewrite page N (or section N), you MUST return UPDATE_SECTION for that sectionId.
+  Do NOT add a new section for a replacement request.
+- Generate unique IDs: sectionId "section-01", blockId "block-01".
+`;
+</file>
+
+<file path="mastra/builder/PptxBuilderAgent.ts">
+import { Agent } from "@mastra/core/agent";
+import { AgentMemory } from "../runtime/AgentMemory";
+import { EmitArtifactActionsTool } from "./tools/EmitArtifactActionsTool";
+import { PptxBuilderAgentInstructions } from "./PptxBuilderAgentInstructions";
+
+export const PPTX_BUILDER_AGENT_ID = "pptx-builder-agent";
+
+export const PptxBuilderAgent = new Agent({
+    id: PPTX_BUILDER_AGENT_ID,
+    name: "PptxBuilderAgent",
+    instructions: PptxBuilderAgentInstructions,
+    model: "openai/gpt-4o",
+    memory: AgentMemory,
+    tools: {
+        EmitArtifactActionsTool,
+    },
+});
+</file>
+
+<file path="mastra/builder/PptxBuilderAgentInstructions.ts">
+export const PptxBuilderAgentInstructions = `
+You are a PowerPoint presentation builder.
+
+You will receive an INTERNAL_CONTEXT message (assistant role) that includes:
+- the current deck JSON (or null)
+- selectedSlideId (optional)
+- slide number mapping
+
+You MUST:
+1) Reply to the user in plain English (brief).
+2) Call EmitArtifactActionsTool EXACTLY ONCE with:
+   { assistantMessage: <string>, actions: <array of actions> }
+
+CRITICAL:
+- Do NOT include raw JSON of actions in your plain text response.
+- Only EmitArtifactActionsTool should contain the actions payload.
+
+SLIDE SYSTEM:
+- Slide dimensions: 960 x 540 px
+- Title layout: x=40, y=30, width=880, height=60, fontSize=36, fontWeight="bold"
+- Body layout:  x=40, y=120, width=880, height=380, fontSize=20
+
+ELEMENT TYPES:
+- text: { id, type:"text", x,y,width,height, content, fontSize, fontWeight?, color?, align? }
+- bulletList: { id, type:"bulletList", x,y,width,height, items[], fontSize, color? }
+- image: { id, type:"image", x,y,width,height, src }
+- shape: { id, type:"shape", x,y,width,height, shapeType, fill?, stroke?, strokeWidth? }
+
+ACTION TYPES (CRUD-ish):
+- UPDATE_DECK_TITLE: { type:"UPDATE_DECK_TITLE", title }
+- UPDATE_DECK_THEME: { type:"UPDATE_DECK_THEME", theme: Partial<DeckTheme> }
+- ADD_SLIDE: { type:"ADD_SLIDE", slideId, elements, insertAt? }
+- UPDATE_SLIDE: { type:"UPDATE_SLIDE", slideId, elements }
+- DELETE_SLIDE: { type:"DELETE_SLIDE", slideId }
+- REORDER_SLIDES: { type:"REORDER_SLIDES", slideIds }
+- ADD_ELEMENT: { type:"ADD_ELEMENT", slideId, element }
+- UPDATE_ELEMENT: { type:"UPDATE_ELEMENT", slideId, elementId, updates }
+- DELETE_ELEMENT: { type:"DELETE_ELEMENT", slideId, elementId }
+
+RULES:
+- When user says "slide N", use the mapping from INTERNAL_CONTEXT.
+- When creating a new deck (no deck yet), generate 5-6 slides, coherent and useful.
+- Generate unique slide IDs like "slide-id-01" and element IDs like "elem-01".
+- Prefer bulletList for body content.
+`;
+</file>
+
+<file path="mastra/builder/types.ts">
+export type BuilderMode = "pptx" | "docx";
+
+// ---- PPTX types ----
+export type TextElement = {
+    id: string;
+    type: "text";
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    content: string;
+    fontSize: number;
+    fontWeight?: "normal" | "bold";
+    color?: string;
+    align?: "left" | "center" | "right";
+};
+
+export type BulletListElement = {
+    id: string;
+    type: "bulletList";
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    items: string[];
+    fontSize: number;
+    color?: string;
+};
+
+export type ImageElement = {
+    id: string;
+    type: "image";
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    src: string;
+};
+
+export type ShapeElement = {
+    id: string;
+    type: "shape";
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    shapeType: "rectangle" | "circle" | "line";
+    fill?: string;
+    stroke?: string;
+    strokeWidth?: number;
+};
+
+export type SlideElement = TextElement | BulletListElement | ImageElement | ShapeElement;
+
+export type Slide = {
+    slideId: string;
+    elements: SlideElement[];
+};
+
+export type DeckTheme = {
+    backgroundColor: string;
+    primaryColor: string;
+    textColor: string;
+    fontFamily: string;
+};
+
+export type Deck = {
+    id: string;
+    title: string;
+    theme: DeckTheme;
+    slides: Slide[];
+    createdAt: string;
+    updatedAt: string;
+};
+
+// ---- DOCX types ----
+export type ParagraphBlock = { id: string; type: "paragraph"; text: string };
+export type BulletsBlock = { id: string; type: "bullets"; items: string[] };
+export type QuoteBlock = { id: string; type: "quote"; text: string };
+export type CodeBlock = { id: string; type: "code"; language?: string; code: string };
+
+export type DocBlock = ParagraphBlock | BulletsBlock | QuoteBlock | CodeBlock;
+
+export type DocSection = {
+    sectionId: string;
+    heading: string;
+    blocks: DocBlock[];
+    startOnNewPage?: boolean;
+};
+
+export type DocTheme = {
+    fontFamily: string;
+    textColor: string;
+    headingColor: string;
+};
+
+export type Doc = {
+    id: string;
+    title: string;
+    theme: DocTheme;
+    sections: DocSection[];
+    createdAt: string;
+    updatedAt: string;
+};
+</file>
+
+<file path="mastra/finance/FinanceAgent.ts">
 import { Agent } from '@mastra/core/agent';
 import { PostgresQueryTool } from "../tools/PostgresQueryTool";
 import { FinanceAgentInstructions } from "./FinanceAgentInstructions";
@@ -553,7 +1075,7 @@ export const FinanceAgent = new Agent({
 });
 </file>
 
-<file path="src/mastra/finance/FinanceAgentInstructions.ts">
+<file path="mastra/finance/FinanceAgentInstructions.ts">
 export const FinanceAgentInstructions = `You are a financial analyst for a hedge fund with access to comprehensive financial data.
 
 CRITICAL REQUIREMENTS:
@@ -868,7 +1390,7 @@ If a question *clearly* needs the minute-level bars (e.g., “show me the 10 hig
 IMPORTANT: You must provide a complete financial analysis response after running queries. Do not just return query results - interpret and analyze the data for investment decisions.`;
 </file>
 
-<file path="src/mastra/runtime/AgentMemory.ts">
+<file path="mastra/runtime/AgentMemory.ts">
 import { Memory } from "@mastra/memory";
 import { LibSQLStore } from "@mastra/libsql";
 
@@ -880,11 +1402,11 @@ export const AgentMemory = new Memory({
 });
 </file>
 
-<file path="src/mastra/runtime/Env.ts">
+<file path="mastra/runtime/Env.ts">
 export const ConnectionString = process.env.CONNECTION_STRING || '';
 </file>
 
-<file path="src/mastra/runtime/FinanceMastraStorage.ts">
+<file path="mastra/runtime/FinanceMastraStorage.ts">
 import { LibSQLStore } from "@mastra/libsql";
 
 // Not sure how I feel about this atm
@@ -894,7 +1416,7 @@ export const FinanceMastraStorage = new LibSQLStore({
 });
 </file>
 
-<file path="src/mastra/tools/PostgresQueryTool.ts">
+<file path="mastra/tools/PostgresQueryTool.ts">
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import { ConnectionString } from "../runtime/Env";
@@ -945,7 +1467,7 @@ export const PostgresQueryTool = createTool({
 });
 </file>
 
-<file path="src/mastra/Hono.ts">
+<file path="mastra/Hono.ts">
 import { HonoBindings, HonoVariables, MastraServer } from "@mastra/hono";
 import { Hono } from "hono";
 import { mastra as _mastra } from "./index";
@@ -976,16 +1498,22 @@ export async function RegisterHonoMastraServer(
 }
 </file>
 
-<file path="src/mastra/index.ts">
+<file path="mastra/index.ts">
 import { Mastra } from '@mastra/core/mastra';
 import { PinoLogger } from '@mastra/loggers';
 import { Observability, SensitiveDataFilter, ConsoleExporter, DefaultExporter } from '@mastra/observability';
 import { FinanceAgent } from "./finance/FinanceAgent";
 import { LibSQLStore } from "@mastra/libsql";
 import { FinanceMastraStorage } from "./runtime/FinanceMastraStorage";
+import { PptxBuilderAgent } from "./builder/PptxBuilderAgent";
+import { DocxBuilderAgent } from "./builder/DocxBuilderAgent";
 
 export const mastra = new Mastra({
-    agents: { FinanceAgent },
+    agents: {
+        FinanceAgent,
+        PptxBuilderAgent,
+        DocxBuilderAgent,
+    },
     storage: FinanceMastraStorage,
     logger: new PinoLogger({
         name: 'Mastra',
@@ -1004,7 +1532,7 @@ export const mastra = new Mastra({
 });
 </file>
 
-<file path="src/Utility/Result.ts">
+<file path="Utility/Result.ts">
 type ResultMatch<T, E, U> = {
     ok: (value: T) => U;
     err: (error: E) => U;
@@ -1138,14 +1666,16 @@ export const Ok = Result.ok;
 export const Err = Result.err;
 </file>
 
-<file path="src/SumerLabsFinanceBackendServer.ts">
+<file path="SumerLabsFinanceBackendServer.ts">
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from 'hono/cors'
 import { HonoBindings, HonoVariables } from "@mastra/hono";
 import { StreamFinanceAgentAiSdk } from "./Http/FinanceHttpHandler";
 import { RegisterHonoMastraServer } from "./mastra/Hono";
-import {CreateChat, GetChat} from "./Http/ChatHttpHandler";
+import { CreateChat, GetChat } from "./Http/ChatHttpHandler";
+import { StreamPptxBuilderAiSdk } from "./Http/PptxBuilderHttpHandler";
+import { StreamDocxBuilderAiSdk } from "./Http/DocxBuilderHttpHandler";
 
 type HonoMastraServerBindings = {
     Bindings: HonoBindings;
@@ -1158,6 +1688,9 @@ app.use(cors());
 await RegisterHonoMastraServer(app);
 
 app.post('/backend-api/finance-agent', StreamFinanceAgentAiSdk)
+app.post("/backend-api/pptx-agent", StreamPptxBuilderAiSdk);
+app.post("/backend-api/docx-agent", StreamDocxBuilderAiSdk);
+
 app.post("/backend-api/chats", CreateChat);
 app.get("/backend-api/chats/:chatId", GetChat);
 
@@ -1166,55 +1699,5 @@ serve({ fetch: app.fetch, port: 4111 }, () => {
 });
 </file>
 
-<file path="package.json">
-{
-    "name": "sl-finance-agent",
-    "version": "1.0.0",
-    "description": "",
-    "main": "index.js",
-    "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1",
-        "dev": "mastra dev",
-        "hono:dev": "tsx watch -r dotenv/config src/SumerLabsFinanceBackendServer.ts",
-        "build": "mastra build",
-        "start": "mastra start"
-    },
-    "keywords": [],
-    "author": "",
-    "license": "ISC",
-    "packageManager": "pnpm@10.25.0",
-    "type": "module",
-    "engines": {
-        "node": ">=22.13.0"
-    },
-    "dependencies": {
-        "@ai-sdk/openai-compatible": "^1.0.29",
-        "@hono/node-server": "^1.19.7",
-        "@mastra/ai-sdk": "1.0.0-beta.7",
-        "@mastra/core": "1.0.0-beta.9",
-        "@mastra/evals": "1.0.0-beta.2",
-        "@mastra/hono": "0.0.2-beta.5",
-        "@mastra/libsql": "1.0.0-beta.7",
-        "@mastra/loggers": "1.0.0-beta.3",
-        "@mastra/mcp": "1.0.0-beta.6",
-        "@mastra/memory": "1.0.0-beta.4",
-        "@mastra/observability": "1.0.0-beta.3",
-        "ai": "^5.0.108",
-        "drizzle-orm": "^0.45.1",
-        "hono": "^4.10.8",
-        "pg": "^8.16.3",
-        "zod": "^4.1.13"
-    },
-    "devDependencies": {
-        "@types/node": "^24.10.2",
-        "@types/pg": "^8.15.6",
-        "dotenv": "^17.2.3",
-        "drizzle-kit": "^0.31.8",
-        "mastra": "1.0.0-beta.7",
-        "tsx": "^4.7.1",
-        "typescript": "^5.9.3"
-    }
-}
-</file>
-
 </files>
+</api>
