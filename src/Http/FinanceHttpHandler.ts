@@ -17,6 +17,9 @@ type StreamFinanceAgentAiSdkRequest = {
     baseChatId: string;
     modelId: string;
 
+    // ✅ NEW: unified context (cross-model + cross-channel) to prepend for the model run
+    contextMessages?: UIMessage[];
+
     // other fields you already send; optional
     useWebSearch?: boolean;
     selectedFileId?: string | null;
@@ -25,20 +28,29 @@ type StreamFinanceAgentAiSdkRequest = {
 export const StreamFinanceAgentAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamFinanceAgentAiSdkRequest;
 
-    const { messages, baseChatId, modelId } = body;
+    const { messages, baseChatId, modelId, contextMessages } = body;
 
     const myAgent = mastra.getAgentById(FINANCE_AGENT_ID);
-    const stream = await myAgent.stream(messages);
+
+    // ✅ Use contextMessages for the model call ONLY (do not persist them in model history)
+    const agentMessages =
+        Array.isArray(contextMessages) && contextMessages.length
+            ? [...contextMessages, ...messages]
+            : messages;
+
+    const stream = await myAgent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
+        // IMPORTANT: keep originalMessages == per-model messages so persistence stays "pure"
         originalMessages: messages,
+
         execute: async ({ writer }) => {
             for await (const part of toAISdkStream(stream, { from: "agent" })) {
                 await writer.write(part);
             }
         },
 
-        // createUIMessageStream’s onFinish gets the final messages/response :contentReference[oaicite:8]{index=8}
+        // createUIMessageStream’s onFinish gets the final messages/response
         onFinish: (async (event) => {
             try {
                 if (!baseChatId || !modelId) return;
@@ -47,7 +59,7 @@ export const StreamFinanceAgentAiSdk = async (c: Context) => {
                 // 1) ensure chat exists
                 await upsertChat(baseChatId);
 
-                // 2) persist per-model full message history
+                // 2) persist per-model full message history (NO contextMessages included)
                 await upsertChatModelState({
                     chatId: baseChatId,
                     modelId,

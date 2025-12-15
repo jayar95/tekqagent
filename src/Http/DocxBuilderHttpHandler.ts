@@ -24,6 +24,9 @@ type StreamDocxBuilderRequest = {
     baseChatId: string;
     modelId: string;
 
+    // ✅ NEW: unified context (cross-model + cross-channel) to prepend for the model run
+    contextMessages?: UIMessage[];
+
     selectedSectionId?: string | null;
 
     useWebSearch?: boolean;
@@ -105,7 +108,7 @@ function stripInternal(messages: UIMessage[]) {
 
 export const StreamDocxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamDocxBuilderRequest;
-    const { messages, baseChatId, modelId, selectedSectionId } = body;
+    const { messages, baseChatId, modelId, selectedSectionId, contextMessages } = body;
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const userText = extractText(lastUser);
@@ -114,11 +117,18 @@ export const StreamDocxBuilderAiSdk = async (c: Context) => {
     const persistedDoc = baseChatId ? await getChatDocState(baseChatId) : null;
 
     const agent = mastra.getAgentById(DOCX_BUILDER_AGENT_ID);
-    const agentMessages = [internalContextMessage(persistedDoc, selectedSectionId, userText), ...messages];
+
+    // ✅ Prepend: internal doc context, then unified cross-chat context, then this model’s own messages
+    const agentMessages = [
+        internalContextMessage(persistedDoc, selectedSectionId, userText),
+        ...(Array.isArray(contextMessages) ? contextMessages : []),
+        ...messages,
+    ];
 
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
+        // IMPORTANT: keep originalMessages == per-model messages so persistence stays "pure"
         originalMessages: messages,
         execute: async ({ writer }) => {
             for await (const part of toAISdkStream(stream, { from: "agent" })) {

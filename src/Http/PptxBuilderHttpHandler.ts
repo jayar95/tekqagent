@@ -24,6 +24,9 @@ type StreamPptxBuilderRequest = {
     baseChatId: string;
     modelId: string;
 
+    // ✅ NEW: unified context (cross-model + cross-channel) to prepend for the model run
+    contextMessages?: UIMessage[];
+
     selectedSlideId?: string | null;
     useWebSearch?: boolean;
 };
@@ -58,18 +61,26 @@ function stripInternal(messages: UIMessage[]) {
 
 export const StreamPptxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamPptxBuilderRequest;
-    const { messages, baseChatId, modelId, selectedSlideId } = body;
+    const { messages, baseChatId, modelId, selectedSlideId, contextMessages } = body;
 
     // ✅ Load deck from DB (server is source of truth)
     const persistedDeck = baseChatId ? await getChatDeckState(baseChatId) : null;
 
     const agent = mastra.getAgentById(PPTX_BUILDER_AGENT_ID);
 
-    const agentMessages = [internalContextMessage(persistedDeck, selectedSlideId), ...messages];
+    // ✅ Prepend: internal deck context, then unified cross-chat context, then this model’s own messages
+    const agentMessages = [
+        internalContextMessage(persistedDeck, selectedSlideId),
+        ...(Array.isArray(contextMessages) ? contextMessages : []),
+        ...messages,
+    ];
+
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
+        // IMPORTANT: keep originalMessages == per-model messages so persistence stays "pure"
         originalMessages: messages,
+
         execute: async ({ writer }) => {
             for await (const part of toAISdkStream(stream, { from: "agent" })) {
                 await writer.write(part);

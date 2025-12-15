@@ -57,8 +57,10 @@ mastra/
       EmitArtifactActionsTool.ts
     DocxBuilderAgent.ts
     DocxBuilderAgentInstructions.ts
+    extractEmitArtifactActions.ts
     PptxBuilderAgent.ts
     PptxBuilderAgentInstructions.ts
+    stateReducers.ts
     types.ts
   finance/
     FinanceAgent.ts
@@ -83,7 +85,8 @@ This section contains the contents of the repository's files.
 import type { UIMessage } from "ai";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "./Db";
-import { chats, chatModelStates, chatTurns, chatTurnModels } from "./schema";
+import { chats, chatModelStates, chatTurns, chatTurnModels, chatDeckStates, chatDocStates } from "./schema";
+import type { Deck, Doc } from "../mastra/builder/types";
 
 function stripFilePartsFromMessage(message: UIMessage): UIMessage {
     return {
@@ -159,6 +162,43 @@ export async function recordTurnIfNeeded(params: {
         .onConflictDoNothing();
 }
 
+// ✅ NEW: deck/doc state helpers
+export async function getChatDeckState(chatId: string): Promise<Deck | null> {
+    const row = await db.query.chatDeckStates.findFirst({
+        where: eq(chatDeckStates.chatId, chatId),
+    });
+    return (row?.deck as Deck) ?? null;
+}
+
+export async function upsertChatDeckState(params: { chatId: string; deck: Deck }) {
+    const { chatId, deck } = params;
+    await db
+        .insert(chatDeckStates)
+        .values({ chatId, deck })
+        .onConflictDoUpdate({
+            target: chatDeckStates.chatId,
+            set: { deck, updatedAt: new Date() },
+        });
+}
+
+export async function getChatDocState(chatId: string): Promise<Doc | null> {
+    const row = await db.query.chatDocStates.findFirst({
+        where: eq(chatDocStates.chatId, chatId),
+    });
+    return (row?.doc as Doc) ?? null;
+}
+
+export async function upsertChatDocState(params: { chatId: string; doc: Doc }) {
+    const { chatId, doc } = params;
+    await db
+        .insert(chatDocStates)
+        .values({ chatId, doc })
+        .onConflictDoUpdate({
+            target: chatDocStates.chatId,
+            set: { doc, updatedAt: new Date() },
+        });
+}
+
 export async function getChatById(chatId: string) {
     const chatRow = await db.query.chats.findFirst({
         where: eq(chats.id, chatId),
@@ -224,10 +264,16 @@ export async function getChatById(chatId: string) {
         modelMessages[ms.modelId] = ms.messages as UIMessage[];
     }
 
+    // ✅ NEW: hydrate persisted artifacts
+    const deck = await getChatDeckState(chatId);
+    const doc = await getChatDocState(chatId);
+
     return {
         chatId,
         turns,
         modelMessages,
+        deck,
+        doc,
     };
 }
 </file>
@@ -241,32 +287,50 @@ export const db = drizzle(process.env.APP_CONNECTION_STRING!, { schema });
 
 <file path="Data/relations.ts">
 import { relations } from "drizzle-orm/relations";
-import { chats, chatTurns, chatTurnModels, chatModelStates } from "./schema";
+import { chats, chatTurns, chatTurnModels, chatModelStates, chatDeckStates, chatDocStates } from "./schema";
 
-export const chatTurnsRelations = relations(chatTurns, ({one}) => ({
+export const chatTurnsRelations = relations(chatTurns, ({ one }) => ({
 	chat: one(chats, {
 		fields: [chatTurns.chatId],
 		references: [chats.id]
 	}),
 }));
 
-export const chatsRelations = relations(chats, ({many}) => ({
+export const chatsRelations = relations(chats, ({ many, one }) => ({
 	chatTurns: many(chatTurns),
 	chatTurnModels: many(chatTurnModels),
 	chatModelStates: many(chatModelStates),
+
+	// one-to-one “artifact states”
+	deckState: one(chatDeckStates, { fields: [chats.id], references: [chatDeckStates.chatId] }),
+	docState: one(chatDocStates, { fields: [chats.id], references: [chatDocStates.chatId] }),
 }));
 
-export const chatTurnModelsRelations = relations(chatTurnModels, ({one}) => ({
+export const chatTurnModelsRelations = relations(chatTurnModels, ({ one }) => ({
 	chat: one(chats, {
 		fields: [chatTurnModels.chatId],
 		references: [chats.id]
 	}),
 }));
 
-export const chatModelStatesRelations = relations(chatModelStates, ({one}) => ({
+export const chatModelStatesRelations = relations(chatModelStates, ({ one }) => ({
 	chat: one(chats, {
 		fields: [chatModelStates.chatId],
 		references: [chats.id]
+	}),
+}));
+
+export const chatDeckStatesRelations = relations(chatDeckStates, ({ one }) => ({
+	chat: one(chats, {
+		fields: [chatDeckStates.chatId],
+		references: [chats.id],
+	}),
+}));
+
+export const chatDocStatesRelations = relations(chatDocStates, ({ one }) => ({
+	chat: one(chats, {
+		fields: [chatDocStates.chatId],
+		references: [chats.id],
 	}),
 }));
 </file>
@@ -274,7 +338,8 @@ export const chatModelStatesRelations = relations(chatModelStates, ({one}) => ({
 <file path="Data/schema.ts">
 import { pgTable, text, timestamp, index, foreignKey, primaryKey, jsonb } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
-import {UIMessage} from "ai";
+import { UIMessage } from "ai";
+import type { Deck, Doc } from "../mastra/builder/types";
 
 
 
@@ -292,11 +357,11 @@ export const chatTurns = pgTable("chat_turns", {
 }, (table) => [
 	index("chat_turns_chat_created_at_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops"), table.createdAt.asc().nullsLast().op("text_ops")),
 	foreignKey({
-			columns: [table.chatId],
-			foreignColumns: [chats.id],
-			name: "chat_turns_chat_id_fkey"
-		}).onDelete("cascade"),
-	primaryKey({ columns: [table.userMessageId, table.chatId], name: "chat_turns_pkey"}),
+		columns: [table.chatId],
+		foreignColumns: [chats.id],
+		name: "chat_turns_chat_id_fkey"
+	}).onDelete("cascade"),
+	primaryKey({ columns: [table.userMessageId, table.chatId], name: "chat_turns_pkey" }),
 ]);
 
 export const chatTurnModels = pgTable("chat_turn_models", {
@@ -307,11 +372,11 @@ export const chatTurnModels = pgTable("chat_turn_models", {
 }, (table) => [
 	index("chat_turn_models_chat_turn_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops"), table.userMessageId.asc().nullsLast().op("text_ops")),
 	foreignKey({
-			columns: [table.chatId],
-			foreignColumns: [chats.id],
-			name: "chat_turn_models_chat_id_fkey"
-		}).onDelete("cascade"),
-	primaryKey({ columns: [table.userMessageId, table.modelId, table.chatId], name: "chat_turn_models_pkey"}),
+		columns: [table.chatId],
+		foreignColumns: [chats.id],
+		name: "chat_turn_models_chat_id_fkey"
+	}).onDelete("cascade"),
+	primaryKey({ columns: [table.userMessageId, table.modelId, table.chatId], name: "chat_turn_models_pkey" }),
 ]);
 
 export const chatModelStates = pgTable("chat_model_states", {
@@ -323,12 +388,50 @@ export const chatModelStates = pgTable("chat_model_states", {
 }, (table) => [
 	index("chat_model_states_chat_id_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops")),
 	foreignKey({
+		columns: [table.chatId],
+		foreignColumns: [chats.id],
+		name: "chat_model_states_chat_id_fkey"
+	}).onDelete("cascade"),
+	primaryKey({ columns: [table.modelId, table.chatId], name: "chat_model_states_pkey" }),
+]);
+
+export const chatDeckStates = pgTable(
+	"chat_deck_states",
+	{
+		chatId: text("chat_id").notNull(),
+		deck: jsonb("deck").$type<Deck>().notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+	},
+	(table) => [
+		index("chat_deck_states_chat_id_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops")),
+		foreignKey({
 			columns: [table.chatId],
 			foreignColumns: [chats.id],
-			name: "chat_model_states_chat_id_fkey"
+			name: "chat_deck_states_chat_id_fkey",
 		}).onDelete("cascade"),
-	primaryKey({ columns: [table.modelId, table.chatId], name: "chat_model_states_pkey"}),
-]);
+		primaryKey({ columns: [table.chatId], name: "chat_deck_states_pkey" }),
+	],
+);
+
+export const chatDocStates = pgTable(
+	"chat_doc_states",
+	{
+		chatId: text("chat_id").notNull(),
+		doc: jsonb("doc").$type<Doc>().notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+		updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+	},
+	(table) => [
+		index("chat_doc_states_chat_id_idx").using("btree", table.chatId.asc().nullsLast().op("text_ops")),
+		foreignKey({
+			columns: [table.chatId],
+			foreignColumns: [chats.id],
+			name: "chat_doc_states_chat_id_fkey",
+		}).onDelete("cascade"),
+		primaryKey({ columns: [table.chatId], name: "chat_doc_states_pkey" }),
+	],
+);
 </file>
 
 <file path="Http/mocks/financeAgentMocks.ts">
@@ -476,15 +579,22 @@ import {
 import { toAISdkStream } from "@mastra/ai-sdk";
 import type { Context } from "hono";
 import { DOCX_BUILDER_AGENT_ID } from "../mastra/builder/DocxBuilderAgent";
-import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+import {
+    recordTurnIfNeeded,
+    upsertChat,
+    upsertChatModelState,
+    getChatDocState,
+    upsertChatDocState,
+} from "../Data/ChatRepository";
 import type { Doc } from "../mastra/builder/types";
+import { extractEmitArtifactActionsPayload } from "../mastra/builder/extractEmitArtifactActions";
+import { applyDocActionsToState } from "../mastra/builder/stateReducers";
 
 type StreamDocxBuilderRequest = {
     messages: UIMessage[];
     baseChatId: string;
     modelId: string;
 
-    doc: Doc | null;
     selectedSectionId?: string | null;
 
     useWebSearch?: boolean;
@@ -495,8 +605,16 @@ function truncate(s: string, max = 16000) {
 }
 
 const ORDINAL: Record<string, number> = {
-    first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
-    sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+    first: 1,
+    second: 2,
+    third: 3,
+    fourth: 4,
+    fifth: 5,
+    sixth: 6,
+    seventh: 7,
+    eighth: 8,
+    ninth: 9,
+    tenth: 10,
 };
 
 function extractText(msg: UIMessage | undefined): string {
@@ -511,14 +629,15 @@ function inferReplaceSectionId(doc: Doc | null, userText: string): string | null
     if (!doc || !doc.sections?.length) return null;
     const lower = userText.toLowerCase();
 
-    // patterns like "replace page 2", "rewrite section 3", "replace the second page"
     const m1 = lower.match(/\b(?:replace|rewrite|overhaul)\s+(?:the\s+)?(?:page|section)\s+(\d+)\b/);
     if (m1) {
         const idx = parseInt(m1[1], 10) - 1;
         return doc.sections[idx]?.sectionId ?? null;
     }
 
-    const m2 = lower.match(/\b(?:replace|rewrite|overhaul)\s+(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:page|section)\b/);
+    const m2 = lower.match(
+        /\b(?:replace|rewrite|overhaul)\s+(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:page|section)\b/,
+    );
     if (m2) {
         const n = ORDINAL[m2[1]];
         const idx = (n ?? 0) - 1;
@@ -529,13 +648,9 @@ function inferReplaceSectionId(doc: Doc | null, userText: string): string | null
 }
 
 function internalContextMessage(doc: Doc | null, selectedSectionId: string | null | undefined, userText: string): UIMessage {
-    const sectionMapping = doc
-        ? doc.sections.map((s, i) => `Section ${i + 1} = ${s.sectionId}`).join("\n")
-        : "No sections yet";
+    const sectionMapping = doc ? doc.sections.map((s, i) => `Section ${i + 1} = ${s.sectionId}`).join("\n") : "No sections yet";
 
-    const summary = doc
-        ? `Current document "${doc.title}" with ${doc.sections.length} sections`
-        : "No document exists yet";
+    const summary = doc ? `Current document "${doc.title}" with ${doc.sections.length} sections` : "No document exists yet";
 
     const replaceSectionId = inferReplaceSectionId(doc, userText);
 
@@ -561,13 +676,16 @@ function stripInternal(messages: UIMessage[]) {
 
 export const StreamDocxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamDocxBuilderRequest;
-    const { messages, baseChatId, modelId, doc, selectedSectionId } = body;
+    const { messages, baseChatId, modelId, selectedSectionId } = body;
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const userText = extractText(lastUser);
 
+    // ✅ Load doc from DB
+    const persistedDoc = baseChatId ? await getChatDocState(baseChatId) : null;
+
     const agent = mastra.getAgentById(DOCX_BUILDER_AGENT_ID);
-    const agentMessages = [internalContextMessage(doc, selectedSectionId, userText), ...messages];
+    const agentMessages = [internalContextMessage(persistedDoc, selectedSectionId, userText), ...messages];
 
     const stream = await agent.stream(agentMessages);
 
@@ -580,24 +698,34 @@ export const StreamDocxBuilderAiSdk = async (c: Context) => {
         },
         onFinish: (async (event) => {
             try {
-                console.log(JSON.stringify(event));
                 if (!baseChatId || !modelId) return;
                 if (event.isAborted) return;
 
                 await upsertChat(baseChatId);
 
+                const cleanedMessages = stripInternal(event.messages);
+
                 await upsertChatModelState({
                     chatId: baseChatId,
                     modelId,
-                    messages: stripInternal(event.messages),
+                    messages: cleanedMessages,
                 });
 
-                // record original user message
                 await recordTurnIfNeeded({
                     chatId: baseChatId,
                     userMessage: lastUser,
                     modelId,
                 });
+
+                // ✅ Persist updated doc state
+                const payload = extractEmitArtifactActionsPayload(cleanedMessages);
+                if (payload) {
+                    const currentDoc = await getChatDocState(baseChatId);
+                    const nextDoc = applyDocActionsToState(currentDoc, payload.actions);
+                    if (nextDoc) {
+                        await upsertChatDocState({ chatId: baseChatId, doc: nextDoc });
+                    }
+                }
             } catch (err) {
                 console.error("DOCX builder persistence onFinish failed:", err);
             }
@@ -693,18 +821,23 @@ import {
 import { toAISdkStream } from "@mastra/ai-sdk";
 import type { Context } from "hono";
 import { PPTX_BUILDER_AGENT_ID } from "../mastra/builder/PptxBuilderAgent";
-import { recordTurnIfNeeded, upsertChat, upsertChatModelState } from "../Data/ChatRepository";
+import {
+    recordTurnIfNeeded,
+    upsertChat,
+    upsertChatModelState,
+    getChatDeckState,
+    upsertChatDeckState,
+} from "../Data/ChatRepository";
 import type { Deck } from "../mastra/builder/types";
+import { extractEmitArtifactActionsPayload } from "../mastra/builder/extractEmitArtifactActions";
+import { applyDeckActionsToState } from "../mastra/builder/stateReducers";
 
 type StreamPptxBuilderRequest = {
     messages: UIMessage[];
     baseChatId: string;
     modelId: string;
 
-    // builder context:
-    deck: Deck | null;
     selectedSlideId?: string | null;
-
     useWebSearch?: boolean;
 };
 
@@ -713,13 +846,9 @@ function truncate(s: string, max = 14000) {
 }
 
 function internalContextMessage(deck: Deck | null, selectedSlideId?: string | null): UIMessage {
-    const slideMapping = deck
-        ? deck.slides.map((s, i) => `Slide ${i + 1} = ${s.slideId}`).join("\n")
-        : "No slides yet";
+    const slideMapping = deck ? deck.slides.map((s, i) => `Slide ${i + 1} = ${s.slideId}`).join("\n") : "No slides yet";
 
-    const summary = deck
-        ? `Current deck "${deck.title}" with ${deck.slides.length} slides`
-        : "No deck exists yet";
+    const summary = deck ? `Current deck "${deck.title}" with ${deck.slides.length} slides` : "No deck exists yet";
 
     const ctx = [
         `INTERNAL_CONTEXT (do not repeat verbatim)`,
@@ -742,11 +871,14 @@ function stripInternal(messages: UIMessage[]) {
 
 export const StreamPptxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamPptxBuilderRequest;
-    const { messages, baseChatId, modelId, deck, selectedSlideId } = body;
+    const { messages, baseChatId, modelId, selectedSlideId } = body;
+
+    // ✅ Load deck from DB (server is source of truth)
+    const persistedDeck = baseChatId ? await getChatDeckState(baseChatId) : null;
 
     const agent = mastra.getAgentById(PPTX_BUILDER_AGENT_ID);
 
-    const agentMessages = [internalContextMessage(deck, selectedSlideId), ...messages];
+    const agentMessages = [internalContextMessage(persistedDeck, selectedSlideId), ...messages];
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
@@ -758,26 +890,37 @@ export const StreamPptxBuilderAiSdk = async (c: Context) => {
         },
         onFinish: (async (event) => {
             try {
-                console.log(JSON.stringify(event));
                 if (!baseChatId || !modelId) return;
                 if (event.isAborted) return;
 
                 await upsertChat(baseChatId);
 
-                // Persist per-model history (strip internal context)
+                const cleanedMessages = stripInternal(event.messages);
+
+                // Persist per-model history
                 await upsertChatModelState({
                     chatId: baseChatId,
                     modelId,
-                    messages: stripInternal(event.messages),
+                    messages: cleanedMessages,
                 });
 
-                // Record the user turn using the ORIGINAL request messages
+                // Record original user message from request
                 const lastUser = [...messages].reverse().find((m) => m.role === "user");
                 await recordTurnIfNeeded({
                     chatId: baseChatId,
                     userMessage: lastUser,
                     modelId,
                 });
+
+                // ✅ Persist updated deck state based on emitted actions
+                const payload = extractEmitArtifactActionsPayload(cleanedMessages);
+                if (payload) {
+                    const currentDeck = await getChatDeckState(baseChatId);
+                    const nextDeck = applyDeckActionsToState(currentDeck, payload.actions);
+                    if (nextDeck) {
+                        await upsertChatDeckState({ chatId: baseChatId, deck: nextDeck });
+                    }
+                }
             } catch (err) {
                 console.error("PPTX builder persistence onFinish failed:", err);
             }
@@ -880,6 +1023,46 @@ RULES:
 `;
 </file>
 
+<file path="mastra/builder/extractEmitArtifactActions.ts">
+import type { UIMessage } from "ai";
+
+export type EmitArtifactActionsPayload = {
+    assistantMessage: string;
+    actions: unknown[];
+};
+
+/**
+ * Finds the most recent assistant message containing the EmitArtifactActions tool output.
+ */
+export function extractEmitArtifactActionsPayload(messages: UIMessage[]): EmitArtifactActionsPayload | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (!msg || msg.role !== "assistant") continue;
+
+        const parts = (msg.parts ?? []) as any[];
+
+        // In AI SDK 5, tool parts are typed like: `tool-${toolName}`
+        // Your frontend already uses `includes("EmitArtifactActions")`, so we mirror it.
+        const toolPart = parts.find(
+            (p) => p && typeof p.type === "string" && p.type.includes("EmitArtifactActions"),
+        );
+
+        const output = toolPart?.output;
+        if (!output || typeof output !== "object") continue;
+
+        const assistantMessage = (output as any).assistantMessage;
+        const actions = (output as any).actions;
+
+        if (typeof assistantMessage !== "string") continue;
+        if (!Array.isArray(actions)) continue;
+
+        return { assistantMessage, actions };
+    }
+
+    return null;
+}
+</file>
+
 <file path="mastra/builder/PptxBuilderAgent.ts">
 import { Agent } from "@mastra/core/agent";
 import { AgentMemory } from "../runtime/AgentMemory";
@@ -946,6 +1129,212 @@ RULES:
 - Generate unique slide IDs like "slide-id-01" and element IDs like "elem-01".
 - Prefer bulletList for body content.
 `;
+</file>
+
+<file path="mastra/builder/stateReducers.ts">
+import { generateId } from "ai";
+import type { Deck, SlideElement, DeckTheme, Doc, DocTheme } from "./types";
+
+// Keep these aligned with the frontend defaults
+const DEFAULT_DECK_THEME: DeckTheme = {
+    backgroundColor: "#ffffff",
+    primaryColor: "#0088cc",
+    textColor: "#1a1a1a",
+    fontFamily: "Arial",
+};
+
+const DEFAULT_DOC_THEME: DocTheme = {
+    fontFamily: "Arial",
+    textColor: "#1a1a1a",
+    headingColor: "#0f172a",
+};
+
+function createEmptyDeckFromActions(actions: any[]): Deck {
+    const now = new Date().toISOString();
+    const titleAction = actions.find((a) => a?.type === "UPDATE_DECK_TITLE" && typeof a.title === "string");
+    const title = titleAction?.title ?? "Untitled Presentation";
+
+    return {
+        id: generateId(),
+        title,
+        theme: DEFAULT_DECK_THEME,
+        slides: [],
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+
+function createEmptyDocFromActions(actions: any[]): Doc {
+    const now = new Date().toISOString();
+    const titleAction = actions.find((a) => a?.type === "DOC_SET_TITLE" && typeof a.title === "string");
+    const title = titleAction?.title ?? "Untitled Document";
+
+    return {
+        id: generateId(),
+        title,
+        theme: DEFAULT_DOC_THEME,
+        sections: [],
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+
+function deckReducer(deck: Deck, action: any): Deck {
+    const now = new Date().toISOString();
+
+    switch (action?.type) {
+        case "ADD_SLIDE": {
+            const newSlide = { slideId: action.slideId, elements: action.elements ?? [] };
+            const slides = [...deck.slides];
+            if (action.insertAt !== undefined && action.insertAt >= 0 && action.insertAt <= slides.length) {
+                slides.splice(action.insertAt, 0, newSlide);
+            } else {
+                slides.push(newSlide);
+            }
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "UPDATE_SLIDE": {
+            const idx = deck.slides.findIndex((s) => s.slideId === action.slideId);
+            if (idx === -1) return deck;
+            const slides = [...deck.slides];
+            slides[idx] = { ...slides[idx], elements: action.elements ?? [] };
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "DELETE_SLIDE": {
+            const slides = deck.slides.filter((s) => s.slideId !== action.slideId);
+            if (slides.length === deck.slides.length) return deck;
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "REORDER_SLIDES": {
+            const slideMap = new Map(deck.slides.map((s) => [s.slideId, s] as const));
+            const reordered = (action.slideIds ?? [])
+                .map((id: string) => slideMap.get(id))
+                .filter((s: any) => Boolean(s));
+            if (reordered.length !== deck.slides.length) return deck;
+            return { ...deck, slides: reordered, updatedAt: now };
+        }
+
+        case "ADD_ELEMENT": {
+            const idx = deck.slides.findIndex((s) => s.slideId === action.slideId);
+            if (idx === -1) return deck;
+            const slides = [...deck.slides];
+            slides[idx] = { ...slides[idx], elements: [...slides[idx].elements, action.element] };
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "UPDATE_ELEMENT": {
+            const idx = deck.slides.findIndex((s) => s.slideId === action.slideId);
+            if (idx === -1) return deck;
+            const slide = deck.slides[idx];
+            const eidx = slide.elements.findIndex((e) => e.id === action.elementId);
+            if (eidx === -1) return deck;
+
+            const slides = [...deck.slides];
+            const elements = [...slide.elements];
+            elements[eidx] = { ...elements[eidx], ...(action.updates ?? {}) } as SlideElement;
+            slides[idx] = { ...slide, elements };
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "DELETE_ELEMENT": {
+            const idx = deck.slides.findIndex((s) => s.slideId === action.slideId);
+            if (idx === -1) return deck;
+            const slide = deck.slides[idx];
+            const elements = slide.elements.filter((e) => e.id !== action.elementId);
+            if (elements.length === slide.elements.length) return deck;
+
+            const slides = [...deck.slides];
+            slides[idx] = { ...slide, elements };
+            return { ...deck, slides, updatedAt: now };
+        }
+
+        case "UPDATE_DECK_TITLE":
+            return { ...deck, title: action.title ?? deck.title, updatedAt: now };
+
+        case "UPDATE_DECK_THEME":
+            return { ...deck, theme: { ...deck.theme, ...(action.theme ?? {}) }, updatedAt: now };
+
+        default:
+            return deck;
+    }
+}
+
+export function applyDeckActionsToState(deck: Deck | null, actions: unknown[]): Deck | null {
+    if (!Array.isArray(actions) || actions.length === 0) return deck;
+    const base = deck ?? createEmptyDeckFromActions(actions as any[]);
+    return (actions as any[]).reduce((d, a) => deckReducer(d, a), base);
+}
+
+// ---------- DOCX reducer (mirrors src/lib/builder/docReducer.ts) ----------
+function docReducer(doc: Doc, action: any): Doc {
+    const now = new Date().toISOString();
+
+    switch (action?.type) {
+        case "DOC_SET_TITLE":
+            return { ...doc, title: action.title ?? doc.title, updatedAt: now };
+
+        case "DOC_UPDATE_THEME":
+            return { ...doc, theme: { ...doc.theme, ...(action.theme ?? {}) }, updatedAt: now };
+
+        case "ADD_SECTION": {
+            const newSection = {
+                sectionId: action.sectionId,
+                heading: action.heading,
+                blocks: action.blocks ?? [],
+                startOnNewPage: action.startOnNewPage ?? false,
+            };
+            const sections = [...doc.sections];
+            if (action.insertAt !== undefined && action.insertAt >= 0 && action.insertAt <= sections.length) {
+                sections.splice(action.insertAt, 0, newSection);
+            } else {
+                sections.push(newSection);
+            }
+            return { ...doc, sections, updatedAt: now };
+        }
+
+        case "UPDATE_SECTION": {
+            const idx = doc.sections.findIndex((s) => s.sectionId === action.sectionId);
+            if (idx === -1) return doc;
+
+            const sections = [...doc.sections];
+            sections[idx] = {
+                ...sections[idx],
+                ...(action.heading !== undefined ? { heading: action.heading } : {}),
+                ...(action.blocks !== undefined ? { blocks: action.blocks } : {}),
+                ...(action.startOnNewPage !== undefined ? { startOnNewPage: action.startOnNewPage } : {}),
+            };
+
+            return { ...doc, sections, updatedAt: now };
+        }
+
+        case "DELETE_SECTION": {
+            const sections = doc.sections.filter((s) => s.sectionId !== action.sectionId);
+            if (sections.length === doc.sections.length) return doc;
+            return { ...doc, sections, updatedAt: now };
+        }
+
+        case "REORDER_SECTIONS": {
+            const map = new Map(doc.sections.map((s) => [s.sectionId, s] as const));
+            const reordered = (action.sectionIds ?? [])
+                .map((id: string) => map.get(id))
+                .filter((s: any) => Boolean(s));
+            if (reordered.length !== doc.sections.length) return doc;
+            return { ...doc, sections: reordered, updatedAt: now };
+        }
+
+        default:
+            return doc;
+    }
+}
+
+export function applyDocActionsToState(doc: Doc | null, actions: unknown[]): Doc | null {
+    if (!Array.isArray(actions) || actions.length === 0) return doc;
+    const base = doc ?? createEmptyDocFromActions(actions as any[]);
+    return (actions as any[]).reduce((d, a) => docReducer(d, a), base);
+}
 </file>
 
 <file path="mastra/builder/types.ts">
