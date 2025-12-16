@@ -5,9 +5,6 @@ export type EmitArtifactActionsPayload = {
     actions: unknown[];
 };
 
-/**
- * Finds the most recent assistant message containing the EmitArtifactActions tool output.
- */
 export function extractEmitArtifactActionsPayload(messages: UIMessage[]): EmitArtifactActionsPayload | null {
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i];
@@ -15,10 +12,11 @@ export function extractEmitArtifactActionsPayload(messages: UIMessage[]): EmitAr
 
         const parts = (msg.parts ?? []) as any[];
 
-        // In AI SDK 5, tool parts are typed like: `tool-${toolName}`
-        // Your frontend already uses `includes("EmitArtifactActions")`, so we mirror it.
+        // in AI SDK 5 tool parts are typed like: `tool-${toolName}`
         const toolPart = parts.find(
-            (p) => p && typeof p.type === "string" && p.type.includes("EmitArtifactActions"),
+            (p) => p &&
+                typeof p.type === "string" &&
+                p.type.includes("EmitArtifactActions"),
         );
 
         const output = toolPart?.output;

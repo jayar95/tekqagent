@@ -24,7 +24,6 @@ type StreamDocxBuilderRequest = {
     baseChatId: string;
     modelId: string;
 
-    // ✅ NEW: unified context (cross-model + cross-channel) to prepend for the model run
     contextMessages?: UIMessage[];
 
     selectedSectionId?: string | null;
@@ -113,12 +112,10 @@ export const StreamDocxBuilderAiSdk = async (c: Context) => {
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const userText = extractText(lastUser);
 
-    // ✅ Load doc from DB
     const persistedDoc = baseChatId ? await getChatDocState(baseChatId) : null;
 
     const agent = mastra.getAgentById(DOCX_BUILDER_AGENT_ID);
 
-    // ✅ Prepend: internal doc context, then unified cross-chat context, then this model’s own messages
     const agentMessages = [
         internalContextMessage(persistedDoc, selectedSectionId, userText),
         ...(Array.isArray(contextMessages) ? contextMessages : []),
@@ -128,7 +125,6 @@ export const StreamDocxBuilderAiSdk = async (c: Context) => {
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
-        // IMPORTANT: keep originalMessages == per-model messages so persistence stays "pure"
         originalMessages: messages,
         execute: async ({ writer }) => {
             for await (const part of toAISdkStream(stream, { from: "agent" })) {
@@ -156,7 +152,6 @@ export const StreamDocxBuilderAiSdk = async (c: Context) => {
                     modelId,
                 });
 
-                // ✅ Persist updated doc state
                 const payload = extractEmitArtifactActionsPayload(cleanedMessages);
                 if (payload) {
                     const currentDoc = await getChatDocState(baseChatId);

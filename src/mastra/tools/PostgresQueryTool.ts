@@ -12,9 +12,9 @@ export const PostgresQueryTool = createTool({
     execute: async ({ query }) => {
         const client = new Client({
             connectionString: ConnectionString,
-            connectionTimeoutMillis: 30000, // 30 seconds
-            statement_timeout: 60000, // 1 minute
-            query_timeout: 60000, // 1 minute
+            connectionTimeoutMillis: 30000,
+            statement_timeout: 60000,
+            query_timeout: 60000,
         });
 
         try {

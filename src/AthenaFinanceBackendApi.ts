@@ -7,6 +7,7 @@ import { RegisterHonoMastraServer } from "./mastra/Hono";
 import { CreateChat, GetChat } from "./Http/ChatHttpHandler";
 import { StreamPptxBuilderAiSdk } from "./Http/PptxBuilderHttpHandler";
 import { StreamDocxBuilderAiSdk } from "./Http/DocxBuilderHttpHandler";
+import {SemanticCoreModule} from "./Domain/SemanticCore/SemanticCoreModule";
 
 type HonoMastraServerBindings = {
     Bindings: HonoBindings;
@@ -17,6 +18,14 @@ const app = new Hono<HonoMastraServerBindings>();
 app.use(cors());
 
 await RegisterHonoMastraServer(app);
+
+const semanticCoreBaseUrl = process.env.SEMANTIC_CORE_BASE_URL ?? "http://localhost:8080";
+
+SemanticCoreModule.Create({
+  BaseUrl: semanticCoreBaseUrl,
+  TimeoutMs: 360_000,
+  RoutePrefix: "/backend-api/semantic-core",
+}).Register(app);
 
 app.post('/backend-api/finance-agent', StreamFinanceAgentAiSdk)
 app.post("/backend-api/pptx-agent", StreamPptxBuilderAiSdk);

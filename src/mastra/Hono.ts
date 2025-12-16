@@ -21,7 +21,7 @@ export async function RegisterHonoMastraServer(
 ): Promise<Result<void, FailedToRegisterMastraError>> {
     const server = new MastraServer({ app, mastra: mastraServerFactory });
 
-    return await Result.fromPromise(
+    return await Result.FromPromise(
         server.init(),
         (_) => new FailedToRegisterMastraError
     )

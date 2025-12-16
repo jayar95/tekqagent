@@ -24,7 +24,7 @@ type StreamPptxBuilderRequest = {
     baseChatId: string;
     modelId: string;
 
-    // ✅ NEW: unified context (cross-model + cross-channel) to prepend for the model run
+    // unified context (cross-model + cross-channel) to prepend for the model run
     contextMessages?: UIMessage[];
 
     selectedSlideId?: string | null;
@@ -63,12 +63,12 @@ export const StreamPptxBuilderAiSdk = async (c: Context) => {
     const body = (await c.req.json()) as StreamPptxBuilderRequest;
     const { messages, baseChatId, modelId, selectedSlideId, contextMessages } = body;
 
-    // ✅ Load deck from DB (server is source of truth)
+    // Load deck from DB (server is source of truth)
     const persistedDeck = baseChatId ? await getChatDeckState(baseChatId) : null;
 
     const agent = mastra.getAgentById(PPTX_BUILDER_AGENT_ID);
 
-    // ✅ Prepend: internal deck context, then unified cross-chat context, then this model’s own messages
+    // prepend internal deck context, then unified cross-chat context, then this model’s own messages
     const agentMessages = [
         internalContextMessage(persistedDeck, selectedSlideId),
         ...(Array.isArray(contextMessages) ? contextMessages : []),
@@ -78,7 +78,7 @@ export const StreamPptxBuilderAiSdk = async (c: Context) => {
     const stream = await agent.stream(agentMessages);
 
     const uiMessageStream = createUIMessageStream({
-        // IMPORTANT: keep originalMessages == per-model messages so persistence stays "pure"
+        // keep originalMessages == per-model messages so persistence stays "pure"
         originalMessages: messages,
 
         execute: async ({ writer }) => {
@@ -110,7 +110,7 @@ export const StreamPptxBuilderAiSdk = async (c: Context) => {
                     modelId,
                 });
 
-                // ✅ Persist updated deck state based on emitted actions
+                // Persist updated deck state based on emitted actions
                 const payload = extractEmitArtifactActionsPayload(cleanedMessages);
                 if (payload) {
                     const currentDeck = await getChatDeckState(baseChatId);

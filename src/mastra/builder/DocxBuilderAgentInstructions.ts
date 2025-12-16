@@ -22,7 +22,7 @@ BLOCK TYPES:
 - quote: { id, type:"quote", text }
 - code: { id, type:"code", language?, code }
 
-ACTION TYPES (CRUD-ish):
+ACTION TYPES:
 - DOC_SET_TITLE: { type:"DOC_SET_TITLE", title }
 - DOC_UPDATE_THEME: { type:"DOC_UPDATE_THEME", theme: Partial<DocTheme> }
 - ADD_SECTION: { type:"ADD_SECTION", sectionId, heading, blocks, insertAt?, startOnNewPage? }

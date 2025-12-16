@@ -4,9 +4,11 @@
     "description": "",
     "main": "index.js",
     "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1",
+        "test": "vitest",
+        "test:coverage": "vitest run --coverage",
+        "test:integration": "vitest run --dir tests --reporter=verbose",
         "dev": "mastra dev",
-        "hono:dev": "tsx watch -r dotenv/config src/SumerLabsFinanceBackendServer.ts",
+        "hono:dev": "tsx watch -r dotenv/config src/AthenaFinanceBackendApi.ts",
         "build": "mastra build",
         "start": "mastra start"
     },
@@ -34,15 +36,18 @@
         "drizzle-orm": "^0.45.1",
         "hono": "^4.10.8",
         "pg": "^8.16.3",
+        "rxjs": "^7.8.2",
         "zod": "^4.1.13"
     },
     "devDependencies": {
         "@types/node": "^24.10.2",
         "@types/pg": "^8.15.6",
+        "@vitest/coverage-v8": "^4.0.15",
         "dotenv": "^17.2.3",
         "drizzle-kit": "^0.31.8",
         "mastra": "1.0.0-beta.7",
         "tsx": "^4.7.1",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "vitest": "^4.0.15"
     }
 }

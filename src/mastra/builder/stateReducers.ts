@@ -1,7 +1,6 @@
 import { generateId } from "ai";
 import type { Deck, SlideElement, DeckTheme, Doc, DocTheme } from "./types";
 
-// Keep these aligned with the frontend defaults
 const DEFAULT_DECK_THEME: DeckTheme = {
     backgroundColor: "#ffffff",
     primaryColor: "#0088cc",
@@ -134,7 +133,6 @@ export function applyDeckActionsToState(deck: Deck | null, actions: unknown[]): 
     return (actions as any[]).reduce((d, a) => deckReducer(d, a), base);
 }
 
-// ---------- DOCX reducer (mirrors src/lib/builder/docReducer.ts) ----------
 function docReducer(doc: Doc, action: any): Doc {
     const now = new Date().toISOString();
 

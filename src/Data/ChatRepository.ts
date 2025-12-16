@@ -78,7 +78,6 @@ export async function recordTurnIfNeeded(params: {
         .onConflictDoNothing();
 }
 
-// ✅ NEW: deck/doc state helpers
 export async function getChatDeckState(chatId: string): Promise<Deck | null> {
     const row = await db.query.chatDeckStates.findFirst({
         where: eq(chatDeckStates.chatId, chatId),
@@ -164,7 +163,6 @@ export async function getChatById(chatId: string) {
         models: modelsByUserMessageId.get(t.userMessageId) ?? [],
     }));
 
-    // Load model message histories
     const modelStates = await db
         .select({
             modelId: chatModelStates.modelId,
@@ -180,7 +178,6 @@ export async function getChatById(chatId: string) {
         modelMessages[ms.modelId] = ms.messages as UIMessage[];
     }
 
-    // ✅ NEW: hydrate persisted artifacts
     const deck = await getChatDeckState(chatId);
     const doc = await getChatDocState(chatId);
 

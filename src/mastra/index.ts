@@ -1,8 +1,7 @@
 import { Mastra } from '@mastra/core/mastra';
 import { PinoLogger } from '@mastra/loggers';
-import { Observability, SensitiveDataFilter, ConsoleExporter, DefaultExporter } from '@mastra/observability';
+import { Observability, SensitiveDataFilter, DefaultExporter } from '@mastra/observability';
 import { FinanceAgent } from "./finance/FinanceAgent";
-import { LibSQLStore } from "@mastra/libsql";
 import { FinanceMastraStorage } from "./runtime/FinanceMastraStorage";
 import { PptxBuilderAgent } from "./builder/PptxBuilderAgent";
 import { DocxBuilderAgent } from "./builder/DocxBuilderAgent";

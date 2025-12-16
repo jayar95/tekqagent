@@ -1,6 +1,3 @@
-export type BuilderMode = "pptx" | "docx";
-
-// ---- PPTX types ----
 export type TextElement = {
     id: string;
     type: "text";
@@ -73,7 +70,6 @@ export type Deck = {
     updatedAt: string;
 };
 
-// ---- DOCX types ----
 export type ParagraphBlock = { id: string; type: "paragraph"; text: string };
 export type BulletsBlock = { id: string; type: "bullets"; items: string[] };
 export type QuoteBlock = { id: string; type: "quote"; text: string };

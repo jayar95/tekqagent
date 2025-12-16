@@ -12,8 +12,6 @@ export const chatsRelations = relations(chats, ({ many, one }) => ({
 	chatTurns: many(chatTurns),
 	chatTurnModels: many(chatTurnModels),
 	chatModelStates: many(chatModelStates),
-
-	// one-to-one “artifact states”
 	deckState: one(chatDeckStates, { fields: [chats.id], references: [chatDeckStates.chatId] }),
 	docState: one(chatDocStates, { fields: [chats.id], references: [chatDocStates.chatId] }),
 }));

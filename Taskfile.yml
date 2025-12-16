@@ -1,0 +1,11 @@
+version: "3"
+
+tasks:
+  test:integration:
+    desc: Run integration tests
+    env:
+      INTEGRATION_BASE_URL: "http://localhost:4111"
+      INTEGRATION_ROUTE_PREFIX: "/backend-api/semantic-core"
+      INTEGRATION_PDF_PATH: "./data/10k.pdf"
+    cmds:
+      - pnpm run test:integration
